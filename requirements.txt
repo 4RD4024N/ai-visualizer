@@ -1,0 +1,15 @@
+# AI Music Visualizer - Gereksinimler
+# pip install -r requirements.txt
+
+# Ses yakalama (WASAPI loopback — Windows için özel build)
+pyaudio==0.2.14
+
+# Bilimsel hesaplama
+numpy>=1.26.0
+scipy>=1.12.0
+
+# OpenGL pencere & render
+pyglet>=2.0.0
+
+# NOT: anthropic paketi artık gerekli değil — LM Studio local API kullanılıyor
+# LM Studio indir: https://lmstudio.ai
