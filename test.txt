@@ -1,0 +1,9 @@
+import sounddevice as sd
+
+devices = sd.query_devices()
+hostapis = sd.query_hostapis()
+
+print("Tüm cihazlar:")
+for i, d in enumerate(devices):
+    api = hostapis[d['hostapi']]['name']
+    print(f"[{i:2}] {d['name'][:45]:45} in:{d['max_input_channels']} out:{d['max_output_channels']} | {api}")
