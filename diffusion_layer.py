@@ -25,6 +25,7 @@ Modeller: stabilityai/sd-turbo (ticari olmayan lisans), madebyollin/taesd (hızl
           laion/larger_clap_music_and_speech (Apache-2.0, kavram seçimi).
 """
 
+import collections
 import os
 import sys
 import threading
@@ -34,6 +35,21 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 WORK = os.environ.get("AIVIS_WORK", r"D:\ai-visualizer-work")
+
+# CLAP metin uzayında duygu eksenleri: kavram / ruh hali / müzik bu eksenlere izdüşürülür
+AXIS_TEXT = {
+    "pos": ["happy, joyful, cheerful music", "uplifting, euphoric, celebratory music", "bright, positive, feel-good music"],
+    "neg": ["sad, dark, melancholic music", "gloomy, mournful, depressing music", "bleak, painful, hopeless music"],
+    "hi": ["energetic, intense, powerful music", "loud, fast, exciting music"],
+    "lo": ["calm, quiet, relaxing music", "slow, soft, gentle music"],
+}
+# Prompt'a eklenen duygu ifadesi (valence, arousal işaretine göre)
+EMO_PHRASE = {
+    (1, 1): "joyful euphoric atmosphere, vibrant saturated colors, bright sunlight, celebration",
+    (1, -1): "serene happy atmosphere, soft warm light, gentle pastel colors",
+    (-1, 1): "intense dark atmosphere, harsh contrast, stormy",
+    (-1, -1): "melancholic gloomy atmosphere, muted colors, dim light",
+}
 
 ANCHORS = {
     (-1, -1): ["a sad, melancholic artwork", "sorrow, loneliness and grief", "a gloomy, mournful, heartbroken scene"],
@@ -53,11 +69,22 @@ def available():
 
 
 class DiffusionLayer:
-    CONCEPT_EVERY = 1.0        # sn — CLAP 10 sn'lik pencereye bakar, saniyede bir yeter
+    CONCEPT_EVERY = 0.4        # sn — CLAP thread'inin analiz aralığı
+    CLAP_SEC = 5.0             # CLAP'ın baktığı son ses (sn): kısa = müziğe daha çabuk tepki
     N_CONCEPTS = 2             # cümleye giren kavram sayısı
-    POOL, MOOD_POOL = 12, 3    # çekilişin yapıldığı en uyan kavram / ruh hali sayısı
-    SCENE_SEC = 8.0            # bir sahnenin en uzun süresi
+    POOL, MOOD_POOL = 8, 3     # çekilişin yapıldığı en uyan kavram / ruh hali sayısı (dar = şarkıya sadık)
+    SCENE_SEC = 3.0            # bir sahnenin en uzun süresi (beat kilidi yokken)
+    MIN_SCENE = 1.2            # ölçü başı isteğinde bile en kısa sahne
     CHANGE_DIST = 0.12         # müzik değişimi eşiği (CLAP temsilinde kosinüs uzaklığı)
+    RECENT = 4                 # son kaç kavram tekrar seçilmez (ruh hali: son 1)
+    GENRE_EMA = 0.15           # tür olasılığının yumuşatması (her ~0,4 sn) — tür sahne sahne zıplamasın
+    PULSE_NOISE = 120          # beat anındaki karede gürültü artışı (sahne içinde vuruşa tepki)
+    LYRIC_W = 1.5              # söz satırına anlamca yakın kavramların seçimdeki ek ağırlığı
+    LYRIC_WORDS = 12           # prompt'a giren söz satırının en fazla kelime sayısı
+    FRESH_NOISE = 950          # yeni sahnenin ilk karesi: önceki hayalden bağımsız, yüksek gürültü
+    EMO_WEIGHT_C = 1.2         # kavram seçiminde duygu uyumunun ağırlığı (özgüllük z-skoruna eklenir)
+    EMO_WEIGHT_M = 1.8         # ruh hali seçiminde duygu uyumunun ağırlığı
+    EMO_PHRASE_MIN = 0.25      # |valence| ya da |arousal| bunu aşarsa prompt'a duygu ifadesi eklenir
     FRAMINGS = ["", "close-up, ", "wide shot, ", "aerial view, ", "silhouette, ", "panoramic landscape, ",
                 "low angle, ", "detailed scene, "]
     MEMORY = 0.55              # başlangıç resminde önceki hayalin payı
@@ -66,10 +93,26 @@ class DiffusionLayer:
         self.tap = tap
         self.concepts = []             # [(kavram, ağırlık)] — HUD için
         self.mood_name = None          # baskın ruh hali — HUD için
+        self.va_eff = None             # sahnede kullanılan (valence, arousal) — model + CLAP
+        self.valence_bias = 0.0        # kullanıcı ayarı: okumaya eklenir
         self._prev = None              # önceki hayal (hafıza)
         self._scene_t = 0.0            # sahnenin başladığı an
         self._scene_a = None           # sahnenin başındaki CLAP temsili
         self._rng = np.random.default_rng()
+        self._recent_c = collections.deque(maxlen=self.RECENT)
+        self._recent_m = collections.deque(maxlen=1)
+        self.section = "verse"         # ana thread yazar (structure.py etiketi)
+        self.genre_name = None         # HUD için
+        self._genre_p = None           # yumuşatılmış tür olasılıkları
+        self._pulse = False            # ana thread: beat anı
+        self.lyrics = None             # LyricsListener (varsa)
+        self.lyric_used = None         # sahnede kullanılan söz satırı — HUD için
+        self._lyric_seen = 0
+        self._lyric_emb = (None, None) # (metin, CLAP metin temsili) önbelleği
+        self._want_scene = False       # ana thread: ölçü başında yeni sahne iste
+        self._fresh = True             # yeni sahnenin ilk karesi mi
+        self._flip = (False, False)    # sahneye özgü kadraj dönüşümü
+        self._shift = (0.0, 0.0)
         self.w, self.h = size
         self.noise = int(noise)
         self.seed = seed
@@ -82,6 +125,8 @@ class DiffusionLayer:
         self._inp = None               # (style, latent, va) — son gönderilen girdi
         self._inp_id = 0
         self._lock = threading.Lock()
+        self._clap = None              # CLAP thread'inin son çıktısı: (a, z, zm, tür_indeksi)
+        self._clap_lock = threading.Lock()
 
     # ── Ana thread ──
     def start(self):
@@ -96,6 +141,14 @@ class DiffusionLayer:
             self._inp = ({k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in style.items()},
                          np.asarray(latent, np.float32).copy(), np.asarray(va, np.float32).copy())
             self._inp_id += 1
+
+    def pulse(self):
+        """Ana thread (her beat): bir sonraki kare daha serbest üretilsin → vuruşta görünür değişim."""
+        self._pulse = True
+
+    def request_scene(self):
+        """Ana thread (ölçü başı): yeni, öncekine benzemeyen bir sahne iste."""
+        self._want_scene = True
 
     def get_frame(self):
         with self._lock:
@@ -130,7 +183,7 @@ class DiffusionLayer:
             import torch
             from transformers import ClapModel, ClapProcessor
             sys.path.insert(0, ROOT)
-            from concepts import CONCEPTS, MOODS, MOOD_SD_TEXT
+            from concepts import CONCEPTS, MOODS, MOOD_SD_TEXT, GENRES, GENRE_CLAP_TEXT, GENRE_SD_TEXT, SECTION_SD_TEXT
             st = np.load(os.path.join(ROOT, "models", "clap_concepts.npz"))
             name = str(st["model"])
             self.clap = ClapModel.from_pretrained(name).to(self.dev).eval()
@@ -144,19 +197,61 @@ class DiffusionLayer:
             self.m_text = torch.tensor(st["m_text"], device=self.dev)
             self.m_mean = torch.tensor(st["m_mean"], device=self.dev)
             self.m_std = torch.tensor(st["m_std"], device=self.dev)
+            self._load_axes()
+            with torch.no_grad():
+                gi = self.clap_proc(text=GENRE_CLAP_TEXT, return_tensors="pt", padding=True).to(self.dev)
+                gt = self.clap.get_text_features(**gi)
+                self.g_text = torch.nn.functional.normalize(getattr(gt, "pooler_output", gt), dim=-1)
+            self.g_names, self.g_phrase, self.sec_phrase = [g[0] for g in GENRES], GENRE_SD_TEXT, SECTION_SD_TEXT
             print(f"[Difüzyon] Kavram seçimi açık: {len(CONCEPTS)} kavram + {len(MOODS)} ruh hali (CLAP)")
         except Exception as e:
             self.clap = None
             print(f"[Difüzyon] Kavram seçimi kapalı ({e}) — sadece duygu")
 
-    def _update_concepts(self):
-        """Son ~10 sn müzik → en özgü 3 kavram → içerik metin temsili."""
+    def _load_axes(self):
+        """Duygu eksenleri (CLAP metin uzayı) ve her kavram / ruh halinin bu eksenlerdeki yeri."""
+        torch = self.torch
+
+        def emb(texts):
+            inp = self.clap_proc(text=texts, return_tensors="pt", padding=True).to(self.dev)
+            t = self.clap.get_text_features(**inp)
+            t = torch.nn.functional.normalize(getattr(t, "pooler_output", t), dim=-1)
+            return torch.nn.functional.normalize(t.mean(0), dim=-1)
+
+        with torch.no_grad():
+            e = {k: emb(v) for k, v in AXIS_TEXT.items()}
+        self.ax_v = torch.nn.functional.normalize(e["pos"] - e["neg"], dim=-1)
+        self.ax_a = torch.nn.functional.normalize(e["hi"] - e["lo"], dim=-1)
+
+        def coords(T):                      # kavramlar arasında standartlaştırılmış eksen koordinatı
+            out = []
+            for ax in (self.ax_v, self.ax_a):
+                c = T @ ax
+                out.append((c - c.mean()) / (c.std() + 1e-6))
+            return out
+
+        self.c_v, self.c_a = coords(self.c_text)
+        self.m_v, self.m_a = coords(self.m_text)
+
+    def _clap_emotion(self, zm):
+        """Müziğin ruh hali profili (35 ruh haline özgüllük) ile ruh hallerinin duygu
+        koordinatları arasındaki korelasyon → CLAP'ın (valence, arousal) okuması, −1…1."""
+        def corr(x, y):
+            x, y = x - x.mean(), y - y.mean()
+            return float((x * y).sum() / (x.norm() * y.norm() + 1e-6))
+        return (float(np.clip(2.0 * corr(zm, self.m_v), -1, 1)),
+                float(np.clip(2.0 * corr(zm, self.m_a), -1, 1)))
+
+    def _clap_step(self):
+        """CLAP thread'i: son ~5 sn müzik → temsil, kavram / ruh hali özgüllüğü, tür.
+        Sonuç önbelleğe yazılır; sahne kurma (SD thread'i) beklemeden en sonuncuyu kullanır."""
         if self.clap is None or self.tap is None:
             return
         torch = self.torch
         x, sr = self.tap.latest_raw()
         if sr is None or len(x) < sr:
             return
+        x = x[-int(self.CLAP_SEC * sr):]
         if sr != 48000:
             from scipy.signal import resample_poly
             g = np.gcd(int(sr), 48000)
@@ -167,29 +262,105 @@ class DiffusionLayer:
             a = torch.nn.functional.normalize(getattr(a, "pooler_output", a), dim=-1)[0]
             z = (a @ self.c_text.T - self.c_mean) / self.c_std          # o müziğe özgüllük
             zm = (a @ self.m_text.T - self.m_mean) / self.m_std
+        # Tür: sıfır-atış CLAP (logit ölçeğiyle softmax), zaman içinde yumuşatılmış
+        with torch.no_grad():
+            scale = float(self.clap.logit_scale_a.exp()) if hasattr(self.clap, "logit_scale_a") else 30.0
+            gp = torch.softmax(scale * (a @ self.g_text.T), 0).cpu().numpy()
+        self._genre_p = gp if self._genre_p is None else (1 - self.GENRE_EMA) * self._genre_p + self.GENRE_EMA * gp
+        gi = int(np.argmax(self._genre_p))
+        self.genre_name = self.g_names[gi]
+        torch.cuda.current_stream().synchronize()                       # diğer stream'den güvenle okunsun
+        with self._clap_lock:
+            self._clap = (a, z, zm, gi)
+
+    def _update_concepts(self):
+        """SD thread'i, her kare öncesi: sahne değişmeli mi? Değişecekse yeni cümle kur."""
+        if self.clap is None:
+            return
+        with self._clap_lock:
+            cs = self._clap
+        if cs is None:
+            return
+        a, z, zm, gi = cs
+        torch = self.torch
         now = time.time()
+        age = now - self._scene_t
         changed = self._scene_a is None or float(1 - (a @ self._scene_a)) > self.CHANGE_DIST
-        if not (changed or now - self._scene_t >= self.SCENE_SEC):
+        lyric = self.lyrics.current() if (self.lyrics is not None and self.lyrics.enabled) else None
+        new_line = lyric is not None and self.lyrics.line_id != self._lyric_seen
+        wanted = (self._want_scene or new_line) and age >= self.MIN_SCENE
+        if not (changed or wanted or age >= self.SCENE_SEC):
             return                                                       # sahne sürüyor
+        self._want_scene = False
         rng = self._rng
 
-        def draw(scores, pool, k, temp):
+        # Duygu: duygu başlığı (DEAM) + CLAP'ın kendi okuması — ikisinin ortalaması
+        with self._lock:
+            va_m = None if self._inp is None else self._inp[2]
+        v_c, a_c = self._clap_emotion(zm)
+        if va_m is None:
+            ev, ea = v_c, a_c
+        else:
+            ev, ea = 0.5 * float(va_m[0]) + 0.5 * v_c, 0.5 * float(va_m[1]) + 0.5 * a_c
+        ev = float(np.clip(ev + self.valence_bias, -1.0, 1.0))
+        self.va_eff = (ev, ea)
+        # Seçim skoru = müziğe özgüllük + duygu uyumu (pozitif şarkı → pozitif kavramlar öne çıkar)
+        z = z + self.EMO_WEIGHT_C * (ev * self.c_v + ea * self.c_a)
+        zm_sel = zm + self.EMO_WEIGHT_M * (ev * self.m_v + ea * self.m_a)
+        # Söz: satıra anlamca yakın kavramlar öne çıkar (CLAP metin uzayında benzerlik)
+        if lyric is not None:
+            self._lyric_seen = self.lyrics.line_id
+            if self._lyric_emb[0] != lyric:
+                with torch.no_grad():
+                    li = self.clap_proc(text=[lyric], return_tensors="pt", padding=True).to(self.dev)
+                    lt = self.clap.get_text_features(**li)
+                    lt = torch.nn.functional.normalize(getattr(lt, "pooler_output", lt), dim=-1)[0]
+                self._lyric_emb = (lyric, lt)
+            ls = self.c_text @ self._lyric_emb[1]
+            z = z + self.LYRIC_W * (ls - ls.mean()) / (ls.std() + 1e-6)
+
+        def draw(scores, pool, k, temp, recent=()):
+            scores = scores.clone()
+            if recent:                                                   # yakın zamanda kullanılanlar dışarıda
+                scores[list(recent)] = -1e9
             top = torch.topk(scores, pool)
             p = torch.softmax(top.values / temp, 0).cpu().numpy().astype(np.float64)
             pick = rng.choice(pool, size=k, replace=False, p=p / p.sum())
             return [int(top.indices[j]) for j in pick], [float(top.values[j]) for j in pick]
 
-        ci, cv = draw(z, self.POOL, self.N_CONCEPTS, 0.5)
-        (mi,), _ = draw(zm, self.MOOD_POOL, 1, 0.3)
+        ci, cv = draw(z, self.POOL, self.N_CONCEPTS, 0.4, self._recent_c)
+        (mi,), _ = draw(zm_sel, self.MOOD_POOL, 1, 0.3, self._recent_m)
+        self._recent_c.extend(ci)
+        self._recent_m.append(mi)
         framing = self.FRAMINGS[rng.integers(len(self.FRAMINGS))]
-        prompt = framing + ", ".join([self.c_phrase[i] for i in ci] + [self.m_phrase[mi]])
+        # Sıra = önem (CLIP 77 token'dan sonrasını keser): konu, tür üslubu, duygu, ruh hali, bölüm anı
+        parts = [self.c_phrase[i] for i in ci] + [self.g_phrase[gi]]
+        self.lyric_used = None
+        if lyric is not None:                                            # söz en başta: en güçlü etki
+            short = " ".join(lyric.split()[:self.LYRIC_WORDS])
+            parts.insert(0, short)
+            self.lyric_used = short
+        if max(abs(ev), abs(ea)) >= self.EMO_PHRASE_MIN:
+            parts.append(EMO_PHRASE[(1 if ev >= 0 else -1, 1 if ea >= 0 else -1)])
+        parts.append(self.m_phrase[mi])
+        sec = self.sec_phrase.get(self.section, "")
+        if sec:
+            parts.append(sec)
+        prompt = framing + ", ".join(parts)
         with torch.no_grad():
             self._prompt_pe = self.pipe.encode_prompt(prompt, self.dev, 1, False)[0]
         self._prompt = prompt
         self.seed = int(rng.integers(1 << 31))                            # yeni kompozisyon
         self._scene_t, self._scene_a = now, a
-        self.concepts = [(self.c_names[i], v) for i, v in zip(ci, cv)]
+        # Önceki sahneyle bağı kopar: hafıza sıfır, ilk kare yüksek gürültü, farklı kadraj
+        self._prev = None
+        self._fresh = True
+        self._flip = (bool(rng.integers(2)), bool(rng.integers(2)))
+        self._shift = (float(rng.uniform(0, 1)), float(rng.uniform(0, 1)))
+        self.concepts = [(self.c_names[i], w) for i, w in zip(ci, cv)]
         self.mood_name = self.m_names[mi]
+        vm = "—" if va_m is None else f"{float(va_m[0]):+.2f}/{float(va_m[1]):+.2f}"
+        print(f"[Difüzyon] sahne  tür {self.genre_name} ({self._genre_p[gi]:.2f})  bölüm {self.section}  v/a {ev:+.2f}/{ea:+.2f}  (model {vm}, CLAP {v_c:+.2f}/{a_c:+.2f})  → {prompt}")
 
     def _blend(self, va):
         v, a = (float(va[0]) + 1) / 2, (float(va[1]) + 1) / 2
@@ -213,11 +384,22 @@ class DiffusionLayer:
             small = torch.nn.functional.interpolate(init, scale_factor=1 / 8, mode="area")
             init = torch.nn.functional.interpolate(small, size=(self.h, self.w), mode="bilinear",
                                                    align_corners=False)      # sadece renk + kaba kompozisyon
-            if self._prev is not None:                                  # hafıza: sahneyi sürdür
+            # Sahneye özgü kadraj: aynı CPPN renkleri her sahnede aynı kompozisyonu vermesin
+            fy, fx = self._flip
+            dims = [d for d, f in ((2, fy), (3, fx)) if f]
+            if dims:
+                init = torch.flip(init, dims)
+            sy, sx = int(self._shift[0] * self.h), int(self._shift[1] * self.w)
+            init = torch.roll(init, shifts=(sy, sx), dims=(2, 3))
+            if self._prev is not None:                                  # hafıza: sahne içinde akıcılık
                 init = self.MEMORY * self._prev + (1 - self.MEMORY) * init
+            noise = max(self.noise, self.FRESH_NOISE) if self._fresh else self.noise
+            if self._pulse and not self._fresh:
+                noise = min(990, noise + self.PULSE_NOISE)
+            self._fresh = self._pulse = False
             gen = torch.Generator(self.dev).manual_seed(self.seed)
             out = self.pipe(prompt_embeds=self._blend(va), image=init, strength=1.0,
-                            timesteps=[self.noise], guidance_scale=0.0, generator=gen,
+                            timesteps=[noise], guidance_scale=0.0, generator=gen,
                             output_type="pt").images[0]
             self._prev = out.float().clamp(0, 1)[None]
             return (self._prev[0].permute(1, 2, 0) * 255).to(torch.uint8).cpu().numpy()
@@ -233,14 +415,18 @@ class DiffusionLayer:
             print(f"[Difüzyon] Yüklenemedi: {e}")
             return
         torch = self.torch
-        last_id, times, last_c = -1, [], 0.0
+        # GPU önceliği: SD yüksek öncelikli stream'de; CLAP ve Whisper düşük öncelikte.
+        # Whisper çalışırken SD'nin kare hızı yarıya düşüyordu (47 → 115 ms).
+        hi = torch.cuda.Stream.priority_range()[1]
+        self._sd_stream = torch.cuda.Stream(priority=hi)
+        threading.Thread(target=self._clap_loop, daemon=True).start()
+        last_id, times = -1, []
+        torch.cuda.set_stream(self._sd_stream)
         while self.running:
-            if time.time() - last_c >= self.CONCEPT_EVERY:
-                last_c = time.time()
-                try:
-                    self._update_concepts()
-                except Exception as e:
-                    print(f"[Difüzyon] Kavram hatası: {e}")
+            try:
+                self._update_concepts()
+            except Exception as e:
+                print(f"[Difüzyon] Kavram hatası: {e}")
             with self._lock:
                 inp, iid = self._inp, self._inp_id
             if inp is None or iid == last_id:
@@ -261,3 +447,15 @@ class DiffusionLayer:
             if len(times) >= 10:
                 self.fps = len(times) / sum(times)
                 times.clear()
+
+    def _clap_loop(self):
+        torch = self.torch
+        torch.cuda.set_stream(torch.cuda.Stream(priority=0))           # düşük öncelik
+        while self.running:
+            t0 = time.time()
+            try:
+                self._clap_step()
+            except Exception as e:
+                print(f"[Difüzyon] CLAP hatası: {e}")
+                time.sleep(0.5)
+            time.sleep(max(0.02, self.CONCEPT_EVERY - (time.time() - t0)))
