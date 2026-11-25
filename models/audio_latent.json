@@ -1,0 +1,19 @@
+{
+  "sr": 16000,
+  "n_fft": 1024,
+  "hop": 256,
+  "n_mels": 64,
+  "frames": 128,
+  "fmin": 30.0,
+  "fmax": 8000.0,
+  "latent": 8,
+  "emb": 128,
+  "val_acc": 0.9742187559604645,
+  "val_jitter": 0.030824725871693773,
+  "pca_explained": 0.9803332686424255,
+  "step": 6250,
+  "tracks": 7994,
+  "datasets": [
+    "fma"
+  ]
+}
