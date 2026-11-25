@@ -1,0 +1,96 @@
+"""
+Ayarlar — config.json (uygulama klasöründe; .exe'de .exe'nin yanında).
+
+Bilinmeyen anahtarlar yok sayılır, eksikler varsayılanla doldurulur, tipler
+varsayılanın tipine dönüştürülür. Dosya bozuksa varsayılanlarla devam edilir.
+Ayarlar menüsü (S) değişiklikleri buraya kaydeder.
+"""
+
+import json
+import os
+import sys
+
+DEFAULTS = {
+    # Pencere
+    "width": 1280,
+    "height": 720,
+    "fullscreen": False,
+    # Ses
+    "device": "",                 # boş = otomatik; dolu = cihaz adında geçen metin (ör. "CABLE")
+    "sensitivity": 1.0,
+    # Görsel
+    "beat_sync": True,            # flash / zoom / sahne ve stil geçişleri beat ızgarasına otursun
+    "section_detection": True,    # bölüm değişince (nakarat, drop…) yeni stil + sahne
+    "flash": 1.0,
+    "zoom_pulse": 1.0,
+    "palette_drift": 0.025,
+    "scene_duration": 22.0,
+    "show_hud": True,
+    "diff_bars": 1,               # difüzyon: kaç ölçüde bir yeni sahne (beat kilitliyken)
+    "diff_valence_bias": 0.0,     # difüzyon: pozitiflik eğilimi (−1 karamsar … +1 neşeli)
+    "lyrics": True,               # şarkı sözlerini dinle (Whisper) ve sahneye kat
+    "lyrics_model": "openai/whisper-medium",   # ya da openai/whisper-large-v3 / whisper-small
+    # Kayıt
+    "record_fps": 30,
+    "record_crf": 18,             # x264 kalite: düşük = daha iyi (18 ≈ görsel kayıpsız)
+    "record_dir": "recordings",
+    "record_hud": False,
+}
+
+
+def app_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+CONFIG_PATH = os.path.join(app_dir(), "config.json")
+
+
+def _coerce(value, default):
+    if isinstance(default, bool):
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on", "evet")
+        return bool(value)
+    if isinstance(default, int):
+        return int(round(float(value)))
+    if isinstance(default, float):
+        return float(value)
+    return str(value)
+
+
+def load(path=CONFIG_PATH):
+    cfg = dict(DEFAULTS)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return cfg
+    except (OSError, ValueError) as e:
+        print(f"[Config] {path} okunamadı ({e}) — varsayılanlar kullanılıyor")
+        return cfg
+    if not isinstance(data, dict):
+        return cfg
+    for k, v in data.items():
+        if k in DEFAULTS:
+            try:
+                cfg[k] = _coerce(v, DEFAULTS[k])
+            except (TypeError, ValueError):
+                print(f"[Config] '{k}' geçersiz ({v!r}) — varsayılan: {DEFAULTS[k]!r}")
+    return cfg
+
+
+def save(cfg, path=CONFIG_PATH):
+    data = {k: cfg.get(k, v) for k, v in DEFAULTS.items()}
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"[Config] Kaydedilemedi: {e}")
+
+
+def resolve_dir(p):
+    """Göreli yolları uygulama klasörüne göre çözer."""
+    return p if os.path.isabs(p) else os.path.join(app_dir(), p)

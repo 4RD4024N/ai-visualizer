@@ -1,3 +1,10 @@
+"""
+Ses cihazlarını listeler. Visualizer yanlış cihazı seçiyorsa, kullanmak istediğiniz
+girişin adından bir parçayı config.json'daki "device" alanına yazın (ör. "CABLE").
+
+  python tools/list_devices.py
+"""
+
 import sounddevice as sd
 
 devices = sd.query_devices()

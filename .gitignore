@@ -1,2 +1,9 @@
 __pycache__/
 *.pyc
+config.json
+config.json.tmp
+recordings/
+neural_styles/
+build/
+dist/
+.pytest_cache/

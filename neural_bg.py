@@ -33,8 +33,10 @@ import pyglet
 from pyglet import gl
 from pyglet.graphics.shader import Shader, ShaderProgram
 
+from config import app_dir
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
-STYLE_DIR = os.path.join(ROOT, "neural_styles")
+STYLE_DIR = os.path.join(app_dir(), "neural_styles")   # .exe'de .exe'nin yanında (yazılabilir)
 EMB_STATS = os.path.join(ROOT, "models", "audio_latent_emb.npz")
 EMO_HEAD = os.path.join(ROOT, "models", "emotion_head.npz")
 VIS_GEN = os.path.join(ROOT, "models", "visual_gen.npz")
@@ -497,6 +499,9 @@ class NeuralBackground:
         self.locked = False
         self.style_timer = 0.0
         self.style_dur = random.uniform(22, 38)
+        self._want_style = None        # None | "slow" | "fast" — ölçü başını bekleyen stil isteği
+        self._want_t = 0.0
+        self.time_real = 0.0
 
         # Animasyon durumu
         self.time = 0.0
@@ -587,7 +592,15 @@ class NeuralBackground:
         self.morph_dur = 1.4 if fast else random.uniform(4.0, 7.0)
         self.style_timer = 0.0
         self.style_dur = random.uniform(22, 38)
+        self._want_style = None
         print(f"[Neural] Yeni stil #{self.style_b['seed']}")
+
+    def request_style(self, fast=False):
+        """Yeni stil iste; beat kilitliyse bir sonraki ölçü başında uygulanır (bkz. update)."""
+        if self._want_style is None:
+            self._want_t = self.time_real
+        if fast or self._want_style is None:
+            self._want_style = "fast" if fast else "slow"
 
     def save_current(self):
         path = save_style(self.cur)
@@ -613,7 +626,9 @@ class NeuralBackground:
         self._dream_target = None if (emb is None or self.dream is None) else np.asarray(emb, np.float32)
 
     # ── Her kare ──
-    def update(self, dt, bands, rms, beat, palette=None, bg=None):
+    def update(self, dt, bands, rms, beat, palette=None, bg=None, downbeat=False, quantize=False):
+        """quantize=True iken stil geçişleri ölçü başına (downbeat) oturur; en fazla 3 sn bekler."""
+        self.time_real += dt
         bands = np.asarray(bands, np.float32)[:LATENT]
         if palette is not None:
             self.palette = [tuple(c) for c in palette]
@@ -635,8 +650,13 @@ class NeuralBackground:
             self.bg = (c0[0] * 0.03, c0[1] * 0.03, c0[2] * 0.03)
         elif not self.locked:
             self.style_timer += dt
-            if self.style_timer >= self.style_dur and self.morph >= 1.0:
-                self.new_style()
+            if self.style_timer >= self.style_dur and self.morph >= 1.0 and self._want_style is None:
+                self.request_style()
+        if self._want_style is not None:
+            if dreaming or self.locked:
+                self._want_style = None
+            elif not quantize or downbeat or self.time_real - self._want_t > 3.0:
+                self.new_style(fast=self._want_style == "fast")
         if dreaming:
             pass
         elif self.morph < 1.0:

@@ -1,1435 +1,81 @@
 """
-AI Music Visualizer v2
-WASAPI Loopback + pyglet 2.x + LM Studio
-DSP-driven görsel katmanlar + AI renk paleti
+AI Music Visualizer
+WASAPI loopback → DSP + beat/bölüm analizi → neural arka plan + preset katmanlar (pyglet 2.x).
+
+Modüller:
+  audio_analyzer  ses yakalama, FFT bantları, beat takibi, bölüm algılama
+  director        ses istatistiklerinden sahne / palet / ruh hali
+  palette         renk paleti geçişleri
+  layers/         preset görsel katmanları
+  neural_bg       CPPN + üretken shader arka planı
+  recorder        MP4 kaydı (ffmpeg)
+  settings_menu   ekran üstü ayarlar (config.json)
 """
 
-import pyglet
-import pyglet.shapes as shapes
-import sounddevice as sd
-import numpy as np
-import threading
-import queue
-import time
 import math
 import os
+import queue
 import random
 
-from neural_bg import NeuralBackground
-from audio_model import AudioTap, AudioLatentModel, MODEL_PATH
+import numpy as np
+import pyglet
+import pyglet.shapes as shapes
+
+import config
 import diffusion_layer
-
-# ── Sabitler ────────────────────────────────────────────────────────────────
-CHUNK       = 1024
-FFT_SIZE    = 4096
-BANDS       = 8
-AI_INTERVAL = 1.5
-TARGET_FPS  = 60
-WINDOW_W    = 1280
-WINDOW_H    = 720
-
-BAND_NAMES  = ["sub_bass","bass","low_mid","mid","high_mid","presence","brilliance","air"]
-BAND_RANGES = [(20,60),(60,250),(250,500),(500,2000),(2000,4000),(4000,6000),(6000,12000),(12000,20000)]
-# ── Ses Analizi ──────────────────────────────────────────────────────────────
-class AudioAnalyzer:
-    def __init__(self):
-        self.stream       = None
-        self.buffer       = np.zeros(FFT_SIZE)
-        self.lock         = threading.Lock()
-        self.running      = False
-        self.bands        = np.zeros(BANDS)
-        self.bands_smooth = np.zeros(BANDS)
-        self.rms          = 0.0
-        self.peak         = 0.0
-        self.bpm_est      = 120.0
-        self._sample_rate = 48000
-        # Onset envelope — BPM autocorrelation için (~6sn @ ~47fps)
-        self._onset_env   = np.zeros(280)
-        self._prev_mag    = None
-        self._frame_dt    = CHUNK / 48000.0   # bir frame'in süresi
-        self._bpm_cooldown = 0.0
-        # Mood istatistikleri — uzun pencereli ortalama
-        self._stat_bands  = np.zeros(BANDS)   # uzun ortalama band enerjisi
-        self._stat_rms    = 0.0
-        self._rms_hist    = []                # son ~3sn RMS (dinamik aralık için)
-        self._flux_hist   = []                # spektral akış geçmişi
-        self.tap          = None              # AudioTap: ses modeli + canlı kayıt için ham ses
-
-    def _find_loopback(self):
-        devices  = sd.query_devices()
-        hostapis = sd.query_hostapis()
-        candidates = []
-        for i, dev in enumerate(devices):
-            name_lower = dev["name"].lower()
-            ch_in = int(dev["max_input_channels"])
-            if ch_in == 0:
-                continue
-            api_name = hostapis[dev["hostapi"]]["name"]
-            score = 0
-            if "cable output" in name_lower:   score = 100
-            elif "stereo mix" in name_lower:   score = 60
-            elif "what u hear" in name_lower:  score = 60
-            if "WASAPI" in api_name:           score += 10
-            if score > 0:
-                candidates.append((score, i, min(ch_in, 2), dev["name"]))
-        if candidates:
-            candidates.sort(key=lambda x: -x[0])
-            _, idx, ch, name = candidates[0]
-            print(f"[Audio] Loopback: [{idx}] {name} ({ch}ch)")
-            return idx, ch
-        return None, 1
-
-    def start(self):
-        dev_idx, ch = self._find_loopback()
-        if dev_idx is not None:
-            for sr in [48000, 44100, 96000, 32000]:
-                try:
-                    self.stream = sd.InputStream(
-                        device=dev_idx, channels=ch,
-                        samplerate=sr, blocksize=CHUNK,
-                        dtype="float32", callback=self._cb,
-                    )
-                    self.stream.start()
-                    self.running = True
-                    self._sample_rate = sr
-                    print(f"[Audio] Loopback aktif ({sr}Hz)")
-                    return
-                except Exception as e:
-                    print(f"[Audio] {sr}Hz: {e}")
-        try:
-            self.stream = sd.InputStream(
-                channels=1, samplerate=48000,
-                blocksize=CHUNK, dtype="float32", callback=self._cb,
-            )
-            self.stream.start()
-            self.running = True
-            print("[Audio] Mikrofon fallback")
-        except Exception as e:
-            print(f"[Audio] Hata: {e}")
-
-    def _cb(self, indata, frames, time_info, status):
-        s = indata[:, 0].copy()
-        if self.tap is not None:
-            self.tap.push(s, self._sample_rate)
-        with self.lock:
-            self.buffer = np.roll(self.buffer, -len(s))
-            self.buffer[-len(s):] = s
-            self._analyze(s)
-
-    def _analyze(self, s):
-        self.rms  = float(np.sqrt(np.mean(s**2)))
-        self.peak = float(np.max(np.abs(s)))
-        win   = np.hanning(len(self.buffer))
-        mag   = np.abs(np.fft.rfft(self.buffer * win))
-        freqs = np.fft.rfftfreq(len(self.buffer), 1.0 / self._sample_rate)
-        for i, (lo, hi) in enumerate(BAND_RANGES):
-            mask   = (freqs >= lo) & (freqs < hi)
-            energy = float(np.mean(mag[mask])) / 50.0 if mask.any() else 0.0
-            self.bands[i] = self.bands[i] * 0.5 + energy * 0.5
-        self.bands_smooth = self.bands_smooth * 0.85 + self.bands * 0.15
-
-        # ── Spektral flux (onset gücü) ──────────────────────────────
-        # Sadece pozitif değişimlerin toplamı = onset envelope değeri
-        if self._prev_mag is not None and len(self._prev_mag) == len(mag):
-            diff = mag - self._prev_mag
-            flux = float(np.sum(diff[diff > 0]))
-        else:
-            flux = 0.0
-        self._prev_mag = mag
-
-        # Onset envelope kaydır
-        self._onset_env = np.roll(self._onset_env, -1)
-        self._onset_env[-1] = flux
-
-        # ── İstatistik toplama (mood için) ──────────────────────────
-        self._stat_bands = self._stat_bands * 0.98 + self.bands * 0.02
-        self._stat_rms   = self._stat_rms * 0.98 + self.rms * 0.02
-        self._rms_hist.append(self.rms)
-        if len(self._rms_hist) > 140: self._rms_hist.pop(0)
-        self._flux_hist.append(flux)
-        if len(self._flux_hist) > 140: self._flux_hist.pop(0)
-
-        # ── BPM: autocorrelation (her ~0.5sn) ───────────────────────
-        self._bpm_cooldown -= self._frame_dt
-        if self._bpm_cooldown <= 0:
-            self._bpm_cooldown = 0.5
-            self._estimate_bpm()
-
-    def _estimate_bpm(self):
-        env = self._onset_env.copy()
-        if np.max(env) < 1e-6:
-            return
-        # Hafif yumuşatma — gürültü azalt
-        kernel = np.array([0.25, 0.5, 0.25])
-        env = np.convolve(env, kernel, mode="same")
-        env = env - np.mean(env)
-        env[env < 0] = 0.0   # yarı dalga doğrultma (onset vurgusu)
-
-        # Autocorrelation
-        ac = np.correlate(env, env, mode="full")[len(env)-1:]
-        if ac[0] <= 1e-9:
-            return
-        ac = ac / ac[0]
-
-        min_bpm, max_bpm = 60, 200
-        min_lag = max(1, int((60.0 / max_bpm) / self._frame_dt))
-        max_lag = int((60.0 / min_bpm) / self._frame_dt)
-        max_lag = min(max_lag, len(ac) - 1)
-        if max_lag <= min_lag:
-            return
-
-        # Harmonik güçlendirme: her lag için katlarını da topla
-        # (gerçek tempo, alt-katlarda da tepe yapar → birleştir)
-        scores = np.zeros(max_lag + 1)
-        for lag in range(min_lag, max_lag + 1):
-            s = ac[lag]
-            for mult, w in ((2, 0.5), (3, 0.33), (4, 0.25)):
-                if lag * mult <= len(ac) - 1:
-                    s += ac[lag * mult] * w
-            scores[lag] = s
-
-        # Tempo önceli: 120 BPM civarını tercih et (log-Gauss ağırlık)
-        # → oktav hatalarını (60↔120↔240) azaltır
-        lags = np.arange(min_lag, max_lag + 1)
-        bpms = 60.0 / (lags * self._frame_dt)
-        pref = 120.0
-        sigma = 0.55
-        weight = np.exp(-0.5 * (np.log2(bpms / pref) / sigma) ** 2)
-        weighted = scores[min_lag:max_lag + 1] * weight
-
-        best_i = int(np.argmax(weighted))
-        best_lag = min_lag + best_i
-        peak_val = scores[best_lag]
-        # Güven: tepe ne kadar baskın
-        confidence = peak_val / (np.mean(scores[min_lag:max_lag+1]) + 1e-6)
-
-        if peak_val < 0.08 or confidence < 1.3:
-            return  # zayıf/belirsiz → mevcut tahmini koru
-
-        bpm = 60.0 / (best_lag * self._frame_dt)
-        while bpm < 70:  bpm *= 2
-        while bpm > 190: bpm /= 2
-
-        # Güvene göre adaptif yumuşatma: yüksek güven → hızlı kilitlen
-        alpha = min(0.5, 0.15 + confidence * 0.08)
-        self.bpm_est = self.bpm_est * (1 - alpha) + bpm * alpha
-
-    def snapshot(self):
-        with self.lock:
-            # Dinamik aralık: yüksek = ritmik/vurgulu, düşük = düz/ambient
-            if len(self._rms_hist) > 10:
-                rms_var = float(np.std(self._rms_hist))
-                rms_max = float(np.max(self._rms_hist))
-                rms_min = float(np.min(self._rms_hist))
-                dyn_range = rms_max - rms_min
-            else:
-                rms_var = dyn_range = 0.0
-            flux_avg = float(np.mean(self._flux_hist)) if self._flux_hist else 0.0
-
-            # Frekans dengesi: bass-ağırlık mı, treble-ağırlık mı
-            sb = self._stat_bands
-            low  = float(np.sum(sb[0:3]))   # sub_bass..low_mid
-            mid  = float(np.sum(sb[3:5]))   # mid..high_mid
-            high = float(np.sum(sb[5:8]))   # presence..air
-            total = low + mid + high + 1e-6
-
-            return {
-                "bands": {k: round(float(v), 3) for k, v in zip(BAND_NAMES, self.bands_smooth)},
-                "rms": round(self.rms, 4),
-                "rms_avg": round(self._stat_rms, 4),
-                "bpm": round(self.bpm_est, 1),
-                "dynamics": round(rms_var, 4),
-                "dynamic_range": round(dyn_range, 4),
-                "onset_activity": round(flux_avg, 2),
-                "spectral_balance": {
-                    "low": round(low/total, 2),
-                    "mid": round(mid/total, 2),
-                    "high": round(high/total, 2),
-                },
-            }
-
-    def get(self):
-        with self.lock:
-            return self.bands.copy().astype(float), float(self.rms), float(self.peak)
-
-    def stop(self):
-        self.running = False
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-
-
-# ── Yerel Direktör (LLM yok) ──────────────────────────────────────────────────
-DEFAULT_PALETTE = [
-    (0.2, 0.4, 1.0),
-    (0.9, 0.1, 0.8),
-    (1.0, 0.5, 0.1),
-    (0.1, 0.9, 0.5),
-]
-
-
-class LocalDirector:
-    """Ses istatistiklerinden sahne/palet/hız seçer — dış servis yok.
-    Çıktı formatı eski AIDirector ile aynı (dir_queue'ya dict)."""
-    INTERVAL = 3.0
-
-    def __init__(self, audio, q):
-        self.audio   = audio
-        self.queue   = q
-        self.running = False
-        self._ref    = {"rms": 1e-3, "flux": 1e-3, "dyn": 1e-4}   # uyarlanır tavan
-        self._scene  = None
-        self._cand   = None
-        self._hue    = random.random()
-
-    def start(self):
-        self.running = True
-        threading.Thread(target=self._loop, daemon=True).start()
-
-    def stop(self): self.running = False
-
-    def _norm(self, key, v):
-        # Yavaş sönen tepe değere göre 0-1 — cihaz/ses seviyesinden bağımsız
-        self._ref[key] = max(v, self._ref[key] * 0.97)
-        return min(1.0, v / (self._ref[key] + 1e-9))
-
-    def _decide(self, s):
-        if s["rms_avg"] < 1e-4:
-            return None                                          # sessizlik
-        loud = self._norm("rms", s["rms_avg"])
-        flux = self._norm("flux", s["onset_activity"])
-        dyn  = self._norm("dyn", s["dynamics"])
-        tempo = min(1.0, max(0.0, (s["bpm"] - 70) / 100))
-        energy = 0.4 * loud + 0.25 * flux + 0.2 * dyn + 0.15 * tempo
-        low, high = s["spectral_balance"]["low"], s["spectral_balance"]["high"]
-
-        if energy > 0.75:   cand = "storm" if low > 0.5 else "full"
-        elif energy > 0.5:  cand = "galaxy" if low > 0.5 else ("web" if high > 0.25 else "flow")
-        elif energy > 0.28: cand = "flow" if high > 0.2 else "cosmic"
-        else:               cand = "minimal"
-        # Histerezis: aynı aday üst üste iki kez gelirse sahneyi değiştir
-        if cand == self._cand or self._scene is None:
-            self._scene = cand
-        self._cand = cand
-
-        # Palet: bas ağırlığı sıcak (kırmızı/mor), tiz ağırlığı soğuk (camgöbeği/mavi)
-        target_hue = (0.92 + 0.6 * (high - low * 0.5)) % 1.0
-        dh = ((target_hue - self._hue + 0.5) % 1.0) - 0.5
-        self._hue = (self._hue + dh * 0.3 + random.uniform(-0.03, 0.03)) % 1.0
-        sat = 0.45 + 0.55 * energy
-        val = 0.75 + 0.25 * energy
-        spread = 0.08 + 0.25 * energy                            # enerjik → daha zıt renkler
-        import colorsys
-        pal = []
-        for i in range(4):
-            r, g, b = colorsys.hsv_to_rgb((self._hue + i * spread) % 1.0,
-                                          min(1.0, sat + random.uniform(-0.05, 0.05)), val)
-            pal.append({"r": r, "g": g, "b": b})
-        br, bgc, bb = colorsys.hsv_to_rgb(self._hue, 0.8, 0.02 + 0.04 * (1 - energy))
-
-        if energy > 0.75:   mood = "aggressive" if low > 0.5 else "energetic"
-        elif energy > 0.5:  mood = "energetic"
-        elif energy > 0.28: mood = "dreamy" if high > 0.2 else "ethereal"
-        else:               mood = "dark" if low > 0.5 else "calm"
-
-        return {
-            "scene": self._scene,
-            "complexity": round(0.2 + 0.8 * (0.6 * energy + 0.4 * flux), 2),
-            "speed": round(0.6 + 1.3 * (0.5 * energy + 0.5 * tempo), 2),
-            "palette": pal,
-            "bg_r": br, "bg_g": bgc, "bg_b": bb,
-            "mood": mood,
-            "shape_rain": bool(energy > 0.88 and dyn > 0.7),
-            "_type": "full",
-        }
-
-    def _loop(self):
-        while self.running:
-            try:
-                d = self._decide(self.audio.snapshot())
-                if d:
-                    if self.queue.full():
-                        try: self.queue.get_nowait()
-                        except queue.Empty: pass
-                    self.queue.put(d)
-            except Exception as e:
-                print(f"[Director] {e}")
-            time.sleep(self.INTERVAL)
-
-
-
-# ── Renk Paleti (lerp destekli) ───────────────────────────────────────────────
-class Palette:
-    def __init__(self):
-        self._cur = [list(c) for c in DEFAULT_PALETTE]
-        self._tgt = [list(c) for c in DEFAULT_PALETTE]
-        self.bg   = [0.02, 0.0, 0.08]
-        self._tgt_bg = [0.02, 0.0, 0.08]
-        self.mood = "hazir"
-        self.hue_shift   = 0.0
-        self.drift_speed = 0.025      # yavaş renk kayması (0 = kapalı)
-        self._draw = [list(c) for c in DEFAULT_PALETTE]  # çizimde kullanılan (kaymış)
-
-    def randomize(self):
-        """Rastgele canlı palet."""
-        import colorsys
-        base_hue = random.random()
-        for i in range(4):
-            hue = (base_hue + i * 0.22 + random.uniform(-0.05, 0.05)) % 1.0
-            sat = random.uniform(0.7, 1.0)
-            val = random.uniform(0.8, 1.0)
-            r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
-            self._tgt[i] = [r, g, b]
-
-    def set(self, d):
-        pal = d.get("palette", [])
-        for i in range(min(4, len(pal))):
-            self._tgt[i] = [
-                float(pal[i].get("r", self._tgt[i][0])),
-                float(pal[i].get("g", self._tgt[i][1])),
-                float(pal[i].get("b", self._tgt[i][2])),
-            ]
-        self._tgt_bg = [
-            float(d.get("bg_r", 0.02)),
-            float(d.get("bg_g", 0.0)),
-            float(d.get("bg_b", 0.08)),
-        ]
-        self.mood = d.get("mood", "?")
-
-    def update(self, dt):
-        import colorsys
-        spd = dt * 1.5
-        for i in range(4):
-            for j in range(3):
-                self._cur[i][j] += (self._tgt[i][j] - self._cur[i][j]) * min(1.0, spd)
-        for j in range(3):
-            self.bg[j] += (self._tgt_bg[j] - self.bg[j]) * min(1.0, spd)
-        # Yavaş hue kayması — renkler canlı kalsın (frame başına 4 dönüşüm)
-        self.hue_shift = (self.hue_shift + dt * self.drift_speed) % 1.0
-        if self.drift_speed > 0:
-            for i in range(4):
-                r, g, b = self._cur[i]
-                h, s, v = colorsys.rgb_to_hsv(r, g, b)
-                h = (h + self.hue_shift) % 1.0
-                self._draw[i] = list(colorsys.hsv_to_rgb(h, s, v))
-        else:
-            self._draw = [list(c) for c in self._cur]
-
-    def get(self, idx, alpha=1.0):
-        c = self._draw[idx % 4]
-        return (
-            max(0, min(255, int(c[0]*255))),
-            max(0, min(255, int(c[1]*255))),
-            max(0, min(255, int(c[2]*255))),
-            max(0, min(255, int(alpha*255))),
-        )
-
-    def bg_gl(self):
-        return self.bg[0], self.bg[1], self.bg[2]
-
-
-# ── DSP Görsel Katmanlar ──────────────────────────────────────────────────────
-
-def clamp8(v): return max(0, min(255, int(v)))
-
-# Katman 1: Merkezi mandala — sub_bass + bass
-class MandalaLayer:
-    def __init__(self, batch):
-        self.batch   = batch
-        self.angle   = 0.0
-        self.rings   = []
-        self._build()
-
-    def _build(self):
-        for r in self.rings:
-            r.delete()
-        self.rings = []
-        cx, cy = WINDOW_W//2, WINDOW_H//2
-        for i in range(10):
-            r = shapes.Arc(cx, cy, 20 + i*32, color=(255,255,255,30), batch=self.batch)
-            self.rings.append(r)
-
-    def update(self, dt, bands, palette, t, speed_mult=1.0):
-        sub  = float(bands[0])
-        bass = float(bands[1])
-        mid  = float(bands[2])
-        energy = (sub * 0.3 + bass * 0.5 + mid * 0.2)
-        self.angle += dt * (80 + energy * 400) * speed_mult
-        cx, cy = WINDOW_W//2, WINDOW_H//2
-        n = len(self.rings)
-        for i, ring in enumerate(self.rings):
-            phase    = i / n
-            # Her ring farkli frekansta pulse eder
-            freq     = 2.0 + i * 0.8
-            pulse    = 1.0 + energy * 3.5 * abs(math.sin(t * freq + phase * math.pi * 2))
-            base_r   = 20 + i * 32
-            ring.radius   = float(base_r * max(0.3, pulse))
-            ring.x        = cx
-            ring.y        = cy
-            # Her ring farkli hizda, alternating yon
-            spd_mult = (0.3 + phase * 1.4) * (1 if i%2==0 else -1.3)
-            ring.rotation = float(self.angle * spd_mult)
-            alpha = 0.08 + energy * 0.7 + 0.15 * math.sin(t * 1.5 + i)
-            c = palette.get(i % 4, alpha=min(1.0, alpha))
-            try: ring.color = c
-            except: pass
-
-    def delete(self):
-        for r in self.rings: r.delete()
-
-
-# Katman 2: Dönen yıldız geometri — low_mid + mid
-class StarGeometryLayer:
-    def __init__(self, batch):
-        self.batch  = batch
-        self.stars  = []
-        self.angles = []
-        self._build()
-
-    def _build(self):
-        for s in self.stars: s.delete()
-        self.stars   = []
-        self.angles  = []
-        self.phases  = []  # her yildiz icin bagimsiz faz
-        cx, cy = WINDOW_W//2, WINDOW_H//2
-        configs = [
-            (130, 5),
-            (80,  7),
-            (45,  3),
-            (60,  6),
-            (60,  4),
-            (50,  8),
-            (40,  5),
-            (40,  3),
-        ]
-        for sz, spk in configs:
-            star = shapes.Star(cx, cy, sz, sz*0.38, num_spikes=spk,
-                               rotation=0.0, color=(255,255,255,180), batch=self.batch)
-            self.stars.append(star)
-            self.angles.append(random.uniform(0, 360))
-            self.phases.append(random.uniform(0, math.tau))
-
-    def update(self, dt, bands, palette, t):
-        mid_energy = (bands[2] + bands[3]) * 0.5
-        speeds     = [80, -130, 200]
-        sizes      = [120, 75, 45]
-        for i, (star, spd, base_sz) in enumerate(zip(self.stars, speeds, sizes)):
-            self.angles[i] = (self.angles[i] + dt * spd * (1 + mid_energy * 3)) % 360
-            pulse = 1.0 + mid_energy * 1.8 * math.sin(t * math.pi * 6 + i * 1.2)
-            sz    = base_sz * max(0.3, pulse)
-            try: star.rotation = self.angles[i]
-            except: pass
-            star.outer_radius = sz
-            star.inner_radius = sz * 0.38
-            c = palette.get(i, alpha=0.4 + mid_energy * 0.5)
-            try: star.color = c
-            except: pass
-
-
-# Katman 3: Frekans çubuğu (radyal) — tüm bandlar
-class RadialBarsLayer:
-    def __init__(self, batch):
-        self.batch = batch
-        self.lines = []
-        self.N     = 128
-        cx, cy = WINDOW_W//2, WINDOW_H//2
-        for i in range(self.N):
-            line = shapes.Line(cx, cy, cx+1, cy+1,
-                               thickness=2, color=(255,255,255,100), batch=batch)
-            self.lines.append(line)
-
-    def update(self, dt, bands, palette, t, full_fft=None):
-        cx, cy = WINDOW_W//2, WINDOW_H//2
-        N = self.N
-        for i, line in enumerate(self.lines):
-            angle    = (i / N) * math.tau
-            band_idx = int((i / N) * BANDS)
-            energy   = float(bands[band_idx]) if band_idx < BANDS else 0.0
-            # Komsu band ile blend — daha akici
-            next_idx = min(band_idx + 1, BANDS - 1)
-            energy   = energy * 0.7 + float(bands[next_idx]) * 0.3
-            energy  *= (1 + 0.4 * math.sin(t * 4 + i * 0.15))
-            inner_r  = 140
-            outer_r  = inner_r + max(8, energy * 280)
-            x1 = float(cx + math.cos(angle) * inner_r)
-            y1 = float(cy + math.sin(angle) * inner_r)
-            x2 = float(cx + math.cos(angle) * outer_r)
-            y2 = float(cy + math.sin(angle) * outer_r)
-            line.x  = x1; line.y  = y1
-            line.x2 = x2; line.y2 = y2
-            alpha = 0.2 + energy * 0.8
-            c = palette.get(band_idx % 4, alpha=min(1.0, alpha))
-            try: line.color = c
-            except: pass
-
-    def delete(self):
-        for l in self.lines: l.delete()
-
-
-# Katman: Serbest dolasan sekiller — tum bandlar, ekran genelinde hareket
-class FloatingShapesLayer:
-    """Ekranda serbestce yuzen, sekip duran, frekansa pulse eden sekiller."""
-    SHAPE_TYPES = ["circle", "ring", "star", "triangle", "polygon", "hexstar"]
-
-    def __init__(self, batch, count=34):
-        self.batch  = batch
-        self.items  = []
-        self.glows  = []
-        self._build(count)
-
-    def _make_shape(self, kind, x, y, sz, spk):
-        if kind == "circle":
-            return shapes.Circle(x, y, sz, color=(255,255,255,180), batch=self.batch)
-        elif kind == "ring":
-            return shapes.Arc(x, y, sz, color=(255,255,255,180), batch=self.batch)
-        elif kind == "star":
-            return shapes.Star(x, y, sz, sz*0.42, num_spikes=5,
-                               rotation=0.0, color=(255,255,255,180), batch=self.batch)
-        elif kind == "triangle":
-            return shapes.Star(x, y, sz, sz*0.5, num_spikes=3,
-                               rotation=0.0, color=(255,255,255,180), batch=self.batch)
-        elif kind == "hexstar":
-            return shapes.Star(x, y, sz, sz*0.4, num_spikes=6,
-                               rotation=0.0, color=(255,255,255,180), batch=self.batch)
-        else:  # polygon
-            return shapes.Star(x, y, sz, sz*0.88, num_spikes=spk,
-                               rotation=0.0, color=(255,255,255,180), batch=self.batch)
-
-    def _build(self, count):
-        for it in self.items: it["obj"].delete()
-        for g in self.glows: g.delete()
-        self.items = []
-        self.glows = []
-        for i in range(count):
-            kind  = random.choice(self.SHAPE_TYPES)
-            sz    = random.uniform(14, 46)
-            spk   = random.randint(4, 8)
-            x     = random.uniform(60, WINDOW_W - 60)
-            y     = random.uniform(60, WINDOW_H - 60)
-            obj   = self._make_shape(kind, x, y, sz, spk)
-            glow  = shapes.Circle(x, y, sz*1.7, color=(255,255,255,0), batch=self.batch)
-            self.items.append({
-                "obj": obj, "glow": glow, "kind": kind,
-                "x": x, "y": y,
-                "vx": random.uniform(-70, 70),
-                "vy": random.uniform(-70, 70),
-                "base": sz, "spk": spk,
-                "angle": random.uniform(0, 360),
-                "rot": random.uniform(-120, 120),
-                "phase": random.uniform(0, math.tau),
-                "band": i % BANDS,
-            })
-
-    def update(self, dt, bands, palette, t, energy_mult=1.0,
-               mouse=None, mouse_mode=0):
-        mx, my = (mouse if mouse else (None, None))
-        for i, it in enumerate(self.items):
-            band   = it["band"]
-            energy = float(bands[band]) * energy_mult
-            # Hareket
-            it["x"] += it["vx"] * dt
-            it["y"] += it["vy"] * dt
-            # Kenar seğmesi
-            if it["x"] < 40:            it["vx"] = abs(it["vx"]);  it["x"] = 40
-            if it["x"] > WINDOW_W - 40: it["vx"] = -abs(it["vx"]); it["x"] = WINDOW_W - 40
-            if it["y"] < 40:            it["vy"] = abs(it["vy"]);  it["y"] = 40
-            if it["y"] > WINDOW_H - 40: it["vy"] = -abs(it["vy"]); it["y"] = WINDOW_H - 40
-
-            # Bass vurusunda hız artar (enerji ivmesi)
-            bass = float(bands[1])
-            if bass > 0.5:
-                it["vx"] *= (1 + bass * dt * 2)
-                it["vy"] *= (1 + bass * dt * 2)
-            # Hız sınırı
-            sp = math.hypot(it["vx"], it["vy"])
-            maxsp = 260
-            if sp > maxsp:
-                it["vx"] *= maxsp / sp; it["vy"] *= maxsp / sp
-
-            # Fare etkisi
-            if mx is not None and mouse_mode != 0:
-                dx = mx - it["x"]; dy = my - it["y"]
-                d2 = dx*dx + dy*dy + 200
-                d  = math.sqrt(d2)
-                if d < 320:
-                    f = 14000 / d2
-                    fx = (dx/d)*f; fy = (dy/d)*f
-                    if mouse_mode == 1:
-                        it["vx"] += fx*dt*60; it["vy"] += fy*dt*60
-                    else:
-                        it["vx"] -= fx*dt*60; it["vy"] -= fy*dt*60
-
-            # Dönüş — enerjiye göre hızlanır
-            it["angle"] = (it["angle"] + it["rot"] * dt * (1 + energy * 4)) % 360
-
-            # Pulse
-            pulse = 1.0 + energy * 2.2 * abs(math.sin(t * 3 + it["phase"]))
-            sz    = it["base"] * max(0.3, pulse)
-
-            obj = it["obj"]
-            obj.x = float(it["x"]); obj.y = float(it["y"])
-            try: obj.rotation = float(it["angle"])
-            except: pass
-            if isinstance(obj, shapes.Circle):
-                obj.radius = sz
-            elif isinstance(obj, shapes.Arc):
-                obj.radius = sz
-            elif isinstance(obj, shapes.Star):
-                obj.outer_radius = sz
-                inner_ratio = 0.88 if it["kind"]=="polygon" else (0.5 if it["kind"]=="triangle" else 0.42)
-                obj.inner_radius = sz * inner_ratio
-
-            alpha = 0.35 + energy * 0.6
-            c = palette.get(band % 4, alpha=min(1.0, alpha))
-            try: obj.color = c
-            except: pass
-
-            # Glow halesi
-            g = it["glow"]
-            g.x = float(it["x"]); g.y = float(it["y"])
-            g.radius = sz * 1.8
-            gc = palette.get(band % 4, alpha=min(0.5, 0.08 + energy * 0.5))
-            try: g.color = gc
-            except: pass
-
-    def delete(self):
-        for it in self.items: it["obj"].delete()
-        for it in self.items: it["glow"].delete()
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  YARATICI KATMANLAR
-# ═══════════════════════════════════════════════════════════════════
-
-# Şok dalgaları — beat anında merkezden genişleyen halkalar
-class ShockwaveLayer:
-    POOL = 16
-    def __init__(self, batch):
-        self.batch = batch
-        self.rings = []
-        cx, cy = WINDOW_W//2, WINDOW_H//2
-        for _ in range(self.POOL):
-            arc = shapes.Arc(cx, cy, 10, thickness=3,
-                             color=(255,255,255,0), batch=batch)
-            self.rings.append({"obj": arc, "active": False,
-                               "r": 0.0, "max": 400, "life": 0.0,
-                               "col": 0, "x": cx, "y": cy})
-        self._prev_bass = 0.0
-
-    def _spawn(self, palette, intensity, x, y):
-        for ring in self.rings:
-            if ring["active"]: continue
-            ring["active"] = True
-            ring["r"]      = 8.0
-            ring["max"]    = 200 + intensity * 500
-            ring["life"]   = 0.0
-            ring["col"]    = random.randint(0, 3)
-            ring["x"]      = x
-            ring["y"]      = y
-            return
-
-    def update(self, dt, bands, palette, t, opacity=1.0, cx=None, cy=None):
-        if cx is None: cx, cy = WINDOW_W//2, WINDOW_H//2
-        bass = float(bands[0] + bands[1]) * 0.5
-        # Beat: bass yükseliş anı
-        if bass - self._prev_bass > 0.18 and bass > 0.35:
-            self._spawn(palette, bass, cx, cy)
-        self._prev_bass = bass
-
-        for ring in self.rings:
-            obj = ring["obj"]
-            if not ring["active"]:
-                obj.color = (0,0,0,0); continue
-            ring["life"] += dt
-            ring["r"]    += dt * (300 + ring["max"]) * 0.7
-            prog = ring["r"] / ring["max"]
-            if prog >= 1.0:
-                ring["active"] = False
-                obj.color = (0,0,0,0); continue
-            obj.x = ring["x"]; obj.y = ring["y"]
-            obj.radius = float(ring["r"])
-            alpha = (1.0 - prog) ** 1.5
-            c = palette.get(ring["col"], alpha=min(1.0, alpha * 0.9) * opacity)
-            try: obj.color = c
-            except: pass
-
-    def delete(self):
-        for r in self.rings: r["obj"].delete()
-
-
-# Yıldız takımı ağı — yüzen düğümler, yakın olanlar çizgiyle bağlanır
-class ConstellationLayer:
-    NODES = 22
-    MAX_LINES = 60
-    THRESH = 220
-    def __init__(self, batch):
-        self.batch = batch
-        self.nodes = []
-        self.dots  = []
-        for i in range(self.NODES):
-            x = random.uniform(60, WINDOW_W-60)
-            y = random.uniform(60, WINDOW_H-60)
-            dot = shapes.Circle(x, y, 3, color=(255,255,255,200), batch=batch)
-            self.dots.append(dot)
-            self.nodes.append({"x":x,"y":y,
-                               "vx":random.uniform(-40,40),
-                               "vy":random.uniform(-40,40),
-                               "band": i % BANDS})
-        self.lines = [shapes.Line(0,0,1,1, thickness=1.2,
-                      color=(255,255,255,0), batch=batch)
-                      for _ in range(self.MAX_LINES)]
-
-    def update(self, dt, bands, palette, t, complexity=0.6, opacity=1.0, mouse=None, mouse_mode=0):
-        mx, my = (mouse if mouse else (None,None))
-        # complexity: bağlantı mesafesi → daha yoğun ağ
-        self.THRESH = 140 + complexity * 180
-        # Düğümleri hareket ettir
-        for nd in self.nodes:
-            energy = float(bands[nd["band"]])
-            nd["x"] += nd["vx"] * dt * (1 + energy)
-            nd["y"] += nd["vy"] * dt * (1 + energy)
-            if nd["x"]<30 or nd["x"]>WINDOW_W-30: nd["vx"]*=-1; nd["x"]=max(30,min(WINDOW_W-30,nd["x"]))
-            if nd["y"]<30 or nd["y"]>WINDOW_H-30: nd["vy"]*=-1; nd["y"]=max(30,min(WINDOW_H-30,nd["y"]))
-            if mx is not None and mouse_mode!=0:
-                dx=mx-nd["x"]; dy=my-nd["y"]; d2=dx*dx+dy*dy+200; d=math.sqrt(d2)
-                if d<300:
-                    f=8000/d2
-                    if mouse_mode==1: nd["vx"]+=(dx/d)*f*dt*60; nd["vy"]+=(dy/d)*f*dt*60
-                    else: nd["vx"]-=(dx/d)*f*dt*60; nd["vy"]-=(dy/d)*f*dt*60
-        # Düğümleri çiz
-        for i, nd in enumerate(self.nodes):
-            energy = float(bands[nd["band"]])
-            dot = self.dots[i]
-            dot.x = float(nd["x"]); dot.y = float(nd["y"])
-            dot.radius = 2.5 + energy * 8
-            c = palette.get(nd["band"] % 4, alpha=min(1.0, 0.5 + energy) * opacity)
-            try: dot.color = c
-            except: pass
-        # Yakın çiftleri bağla
-        li = 0
-        avg_energy = float(np.mean(bands))
-        for a in range(self.NODES):
-            if li >= self.MAX_LINES: break
-            for b in range(a+1, self.NODES):
-                if li >= self.MAX_LINES: break
-                dx = self.nodes[a]["x"]-self.nodes[b]["x"]
-                dy = self.nodes[a]["y"]-self.nodes[b]["y"]
-                dist = math.hypot(dx, dy)
-                if dist < self.THRESH:
-                    ln = self.lines[li]; li += 1
-                    ln.x  = float(self.nodes[a]["x"]); ln.y  = float(self.nodes[a]["y"])
-                    ln.x2 = float(self.nodes[b]["x"]); ln.y2 = float(self.nodes[b]["y"])
-                    fade = (1 - dist/self.THRESH)
-                    c = palette.get(1, alpha=min(0.8, fade * (0.3 + avg_energy)) * opacity)
-                    try: ln.color = c
-                    except: pass
-        for j in range(li, self.MAX_LINES):
-            self.lines[j].color = (0,0,0,0)
-
-    def delete(self):
-        for d in self.dots: d.delete()
-        for l in self.lines: l.delete()
-
-
-# Lissajous / harmonograf — morphing matematiksel eğri
-class LissajousLayer:
-    SEG = 160
-    def __init__(self, batch):
-        self.batch = batch
-        self.lines = [shapes.Line(0,0,1,1, thickness=2,
-                      color=(255,255,255,0), batch=batch)
-                      for _ in range(self.SEG)]
-        self._phase = 0.0
-        self._a = 3.0; self._b = 2.0
-
-    def update(self, dt, bands, palette, t, complexity=0.6, opacity=1.0, cx=None, cy=None):
-        if cx is None: cx, cy = WINDOW_W//2, WINDOW_H//2
-        mid  = float(bands[3] + bands[4])
-        high = float(bands[5] + bands[6])
-        rms_like = float(np.mean(bands))
-        # complexity: temel a/b oranını yükseltir → daha çok lob/karmaşa
-        cbase = 1.0 + complexity * 5.0
-        self._a += (cbase + mid * 4.0 - self._a) * dt * 0.5
-        self._b += (cbase * 0.7 + high * 5.0 - self._b) * dt * 0.5
-        self._phase += dt * (0.6 + rms_like * 2.0)
-        A = min(WINDOW_W, WINDOW_H) * (0.18 + rms_like * 0.22)
-        B = A
-        pts = []
-        for i in range(self.SEG):
-            th = (i / self.SEG) * math.tau
-            x = cx + A * math.sin(self._a * th + self._phase)
-            y = cy + B * math.sin(self._b * th)
-            pts.append((x, y))
-        col_a = palette.get(2)
-        col_b = palette.get(3)
-        for i in range(self.SEG):
-            ln = self.lines[i]
-            x1, y1 = pts[i]
-            x2, y2 = pts[(i+1) % self.SEG]
-            ln.x  = float(x1); ln.y  = float(y1)
-            ln.x2 = float(x2); ln.y2 = float(y2)
-            # Eğri boyunca renk geçişi
-            f = i / self.SEG
-            r = int(col_a[0]*(1-f) + col_b[0]*f)
-            g = int(col_a[1]*(1-f) + col_b[1]*f)
-            b = int(col_a[2]*(1-f) + col_b[2]*f)
-            a = int((120 + rms_like * 135) * opacity)
-            try: ln.color = (r, g, b, min(255, a))
-            except: pass
-
-    def delete(self):
-        for l in self.lines: l.delete()
-
-
-# Akan kurdeleler — yatay sinüs bantları, farklı frekans/renk/hız
-class RibbonLayer:
-    RIBBONS = 4
-    SEG = 90
-    def __init__(self, batch):
-        self.batch   = batch
-        self.ribbons = []
-        for r in range(self.RIBBONS):
-            lines = [shapes.Line(0,0,1,1, thickness=3,
-                     color=(255,255,255,0), batch=batch)
-                     for _ in range(self.SEG)]
-            self.ribbons.append({
-                "lines": lines,
-                "y": WINDOW_H * (0.25 + r * 0.18),
-                "phase": random.uniform(0, math.tau),
-                "speed": 0.8 + r * 0.4,
-                "band": [1, 3, 5, 6][r % 4],
-                "col": r % 4,
-            })
-
-    def update(self, dt, bands, palette, t, complexity=0.6, opacity=1.0):
-        # complexity: kaç kurdele görünür + harmonik zenginliği
-        visible = 1 + int(complexity * (self.RIBBONS - 1) + 0.5)
-        harm    = 1.0 + complexity * 3.0   # ek harmonik gücü
-        for ri, rb in enumerate(self.ribbons):
-            if ri >= visible:
-                for ln in rb["lines"]: ln.color = (0,0,0,0)
-                continue
-            rb["phase"] += dt * rb["speed"] * 2
-            energy = float(bands[rb["band"]])
-            amp = WINDOW_H * (0.04 + energy * 0.16)
-            base_y = rb["y"]
-            col = palette.get(rb["col"], alpha=min(1.0, 0.3 + energy * 0.6) * opacity)
-            lines = rb["lines"]
-            xs = [WINDOW_W * i / (self.SEG-1) for i in range(self.SEG)]
-            for i in range(self.SEG-1):
-                p1 = rb["phase"] + (i/self.SEG)*math.pi*5
-                p2 = rb["phase"] + ((i+1)/self.SEG)*math.pi*5
-                y1 = base_y + math.sin(p1)*amp + math.sin(p1*2.3+1)*amp*0.4*harm*0.3 + math.sin(p1*4.1+2)*amp*0.2*complexity
-                y2 = base_y + math.sin(p2)*amp + math.sin(p2*2.3+1)*amp*0.4*harm*0.3 + math.sin(p2*4.1+2)*amp*0.2*complexity
-                ln = lines[i]
-                ln.x  = float(xs[i]);   ln.y  = float(y1)
-                ln.x2 = float(xs[i+1]); ln.y2 = float(y2)
-                try: ln.color = col
-                except: pass
-            lines[self.SEG-1].color = (0,0,0,0)
-
-    def delete(self):
-        for rb in self.ribbons:
-            for l in rb["lines"]: l.delete()
-
-
-# Spiral galaksi — dönen spiral kollar, bass ile nefes alır
-class SpiralLayer:
-    ARMS = 3
-    PER_ARM = 26
-    def __init__(self, batch):
-        self.batch = batch
-        self.dots  = []
-        cx, cy = WINDOW_W//2, WINDOW_H//2
-        for arm in range(self.ARMS):
-            for j in range(self.PER_ARM):
-                d = shapes.Circle(cx, cy, 3, color=(255,255,255,0), batch=batch)
-                self.dots.append({"obj": d, "arm": arm, "idx": j,
-                                  "band": j % BANDS})
-        self.angle = 0.0
-
-    def update(self, dt, bands, palette, t, complexity=0.6, opacity=1.0, cx=None, cy=None):
-        if cx is None: cx, cy = WINDOW_W//2, WINDOW_H//2
-        bass = float(bands[0] + bands[1]) * 0.5
-        self.angle += dt * (0.4 + bass * 1.5)
-        scale = (min(WINDOW_W, WINDOW_H) * 0.45) * (0.7 + bass * 0.5)
-        # complexity: kıvrım sıkılığı (winding) + görünür nokta oranı
-        winding = 3.0 + complexity * 5.0
-        visible_frac = 0.3 + complexity * 0.7
-        for d in self.dots:
-            arm   = d["arm"]
-            j     = d["idx"]
-            frac  = j / self.PER_ARM
-            if frac > visible_frac:
-                d["obj"].color = (0,0,0,0); continue
-            theta = self.angle + arm * (math.tau / self.ARMS) + frac * winding
-            radius = frac * scale
-            x = cx + math.cos(theta) * radius
-            y = cy + math.sin(theta) * radius
-            energy = float(bands[d["band"]])
-            obj = d["obj"]
-            obj.x = float(x); obj.y = float(y)
-            obj.radius = 2 + frac * 4 + energy * 6
-            alpha = 0.3 + energy * 0.6 + (1-frac) * 0.2
-            c = palette.get(arm % 4, alpha=min(1.0, alpha) * opacity)
-            try: obj.color = c
-            except: pass
-
-    def delete(self):
-        for d in self.dots: d["obj"].delete()
-
-
-# ── Çift sarmal (DNA helix) — dönen ikili sarmal + basamaklar ────────
-class HelixLayer:
-    N = 44
-    def __init__(self, batch):
-        self.batch = batch
-        self.a = [shapes.Circle(0,0,4, color=(255,255,255,0), batch=batch) for _ in range(self.N)]
-        self.b = [shapes.Circle(0,0,4, color=(255,255,255,0), batch=batch) for _ in range(self.N)]
-        self.rungs = [shapes.Line(0,0,1,1, thickness=2, color=(255,255,255,0), batch=batch)
-                      for _ in range(self.N)]
-        self.phase = 0.0
-
-    def update(self, dt, bands, palette, t, complexity=0.6, opacity=1.0, cx=None, cy=None):
-        if cx is None: cx, cy = WINDOW_W//2, WINDOW_H//2
-        mid  = float(bands[2] + bands[3])
-        bass = float(bands[1])
-        self.phase += dt * (1.0 + bass * 2.5)
-        radius = 60 + complexity * 120 + mid * 80
-        span   = WINDOW_H * 0.8
-        turns  = 2.0 + complexity * 3.0
-        for i in range(self.N):
-            frac = i / (self.N - 1)
-            y = cy - span/2 + frac * span
-            ang = self.phase + frac * math.tau * turns
-            energy = float(bands[i % BANDS])
-            xa = cx + math.cos(ang) * radius
-            xb = cx + math.cos(ang + math.pi) * radius
-            # ön/arka derinlik → boyut
-            za = (math.sin(ang) + 1) * 0.5
-            zb = (math.sin(ang + math.pi) + 1) * 0.5
-            da = self.a[i]; db = self.b[i]
-            da.x = float(xa); da.y = float(y); da.radius = 2 + za*5 + energy*4
-            db.x = float(xb); db.y = float(y); db.radius = 2 + zb*5 + energy*4
-            ca = palette.get(0, alpha=min(1.0, (0.3 + za*0.6)) * opacity)
-            cb = palette.get(2, alpha=min(1.0, (0.3 + zb*0.6)) * opacity)
-            try: da.color = ca; db.color = cb
-            except: pass
-            # basamak (her 2 noktada bir görünür)
-            rg = self.rungs[i]
-            if i % 2 == 0:
-                rg.x = float(xa); rg.y = float(y)
-                rg.x2 = float(xb); rg.y2 = float(y)
-                rc = palette.get(1, alpha=min(0.6, 0.2 + mid*0.4) * opacity)
-                try: rg.color = rc
-                except: pass
-            else:
-                rg.color = (0,0,0,0)
-
-    def delete(self):
-        for o in self.a + self.b + self.rungs: o.delete()
-
-
-# ── Tünel / solucan deliği — içe doğru kayan çokgenler ───────────────
-class TunnelLayer:
-    RINGS = 18
-    def __init__(self, batch):
-        self.batch = batch
-        self.rings = []
-        cx, cy = WINDOW_W//2, WINDOW_H//2
-        for i in range(self.RINGS):
-            sides = random.choice([3, 4, 5, 6, 6, 8])
-            arc = shapes.Star(cx, cy, 40, 38, num_spikes=sides, rotation=0.0,
-                              color=(255,255,255,0), batch=batch)
-            self.rings.append({"obj": arc, "z": i / self.RINGS, "spin": random.uniform(-1,1)})
-
-    def update(self, dt, bands, palette, t, complexity=0.6, opacity=1.0, cx=None, cy=None):
-        if cx is None: cx, cy = WINDOW_W//2, WINDOW_H//2
-        bass = float(bands[0] + bands[1]) * 0.5
-        speed = 0.15 + bass * 0.5
-        maxr  = min(WINDOW_W, WINDOW_H) * 0.7
-        for r in self.rings:
-            r["z"] -= dt * speed
-            if r["z"] <= 0.02:
-                r["z"] += 1.0
-            # perspektif: küçük z = uzak (küçük), büyük z = yakın (büyük)
-            radius = maxr * (r["z"] ** 1.8)
-            obj = r["obj"]
-            obj.x = cx; obj.y = cy
-            obj.outer_radius = max(4, radius)
-            obj.inner_radius = max(3, radius * 0.92)
-            try: obj.rotation = float(t * 30 * r["spin"])
-            except: pass
-            depth_alpha = (1.0 - r["z"]) * (0.4 + bass * 0.6)
-            col_idx = int(r["z"] * 4) % 4
-            c = palette.get(col_idx, alpha=min(1.0, depth_alpha) * opacity)
-            try: obj.color = c
-            except: pass
-
-    def delete(self):
-        for r in self.rings: r["obj"].delete()
-
-
-# ── Yıldız patlaması ışınları — merkezden uzanan, pulse eden ışınlar ─
-class BurstRaysLayer:
-    MAX = 72
-    def __init__(self, batch):
-        self.batch = batch
-        self.rays = [shapes.Line(0,0,1,1, thickness=2, color=(255,255,255,0), batch=batch)
-                     for _ in range(self.MAX)]
-        self.angle = 0.0
-
-    def update(self, dt, bands, palette, t, complexity=0.6, opacity=1.0, cx=None, cy=None):
-        if cx is None: cx, cy = WINDOW_W//2, WINDOW_H//2
-        bass = float(bands[0] + bands[1]) * 0.5
-        n = 16 + int(complexity * (self.MAX - 16))
-        self.angle += dt * (20 + bass * 80)
-        inner = 30 + bass * 60
-        for i, ray in enumerate(self.rays):
-            if i >= n:
-                ray.color = (0,0,0,0); continue
-            ang = math.radians(self.angle) + (i / n) * math.tau
-            band = i % BANDS
-            energy = float(bands[band])
-            length = inner + 60 + energy * 320
-            x1 = cx + math.cos(ang) * inner
-            y1 = cy + math.sin(ang) * inner
-            x2 = cx + math.cos(ang) * length
-            y2 = cy + math.sin(ang) * length
-            ray.x = float(x1); ray.y = float(y1)
-            ray.x2 = float(x2); ray.y2 = float(y2)
-            c = palette.get(band % 4, alpha=min(1.0, 0.25 + energy * 0.7) * opacity)
-            try: ray.color = c
-            except: pass
-
-    def delete(self):
-        for r in self.rays: r.delete()
-
-
-# ── Synthwave ızgara — perspektif zemin, bass ile tepe yapar ─────────
-class GridWaveLayer:
-    COLS = 16
-    ROWS = 12
-    def __init__(self, batch):
-        self.batch = batch
-        # yatay çizgiler
-        self.hlines = [shapes.Line(0,0,1,1, thickness=2, color=(255,255,255,0), batch=batch)
-                       for _ in range(self.ROWS)]
-        # dikey çizgiler
-        self.vlines = [shapes.Line(0,0,1,1, thickness=2, color=(255,255,255,0), batch=batch)
-                       for _ in range(self.COLS+1)]
-        self.scroll = 0.0
-
-    def update(self, dt, bands, palette, t, complexity=0.6, opacity=1.0):
-        bass = float(bands[0] + bands[1]) * 0.5
-        self.scroll = (self.scroll + dt * (0.3 + bass)) % 1.0
-        horizon = WINDOW_H * 0.55
-        cx = WINDOW_W / 2
-        col = palette.get(2, alpha=min(1.0, 0.4 + bass * 0.5) * opacity)
-        # Yatay çizgiler — perspektifle aşağı doğru sıklaşır
-        for i, ln in enumerate(self.hlines):
-            f = ((i + self.scroll) / self.ROWS)
-            persp = f ** 2.2
-            y = horizon - persp * horizon * 0.95
-            bump = math.sin(t*3 + i) * bass * 30
-            ln.x = 0; ln.y = float(y + bump)
-            ln.x2 = WINDOW_W; ln.y2 = float(y + bump)
-            a = (1 - f) * (0.4 + bass*0.5)
-            try: ln.color = palette.get(2, alpha=min(1.0, a) * opacity)
-            except: pass
-        # Dikey çizgiler — ufuktan tabana yelpaze
-        for j, ln in enumerate(self.vlines):
-            fx = j / self.COLS
-            x_far  = cx + (fx - 0.5) * WINDOW_W * 0.15
-            x_near = cx + (fx - 0.5) * WINDOW_W * 2.2
-            ln.x = float(x_far);  ln.y = float(horizon)
-            ln.x2 = float(x_near); ln.y2 = 0.0
-            try: ln.color = col
-            except: pass
-
-    def delete(self):
-        for l in self.hlines + self.vlines: l.delete()
-
-
-# ── Güneş sistemi — merkez yıldız + yörüngedeki gezegenler ───────────
-class OrbitsLayer:
-    PLANETS = 7
-    def __init__(self, batch):
-        self.batch = batch
-        cx, cy = WINDOW_W//2, WINDOW_H//2
-        self.sun = shapes.Circle(cx, cy, 20, color=(255,255,255,0), batch=batch)
-        self.orbits = [shapes.Arc(cx, cy, 60+i*55, color=(255,255,255,0), batch=batch)
-                       for i in range(self.PLANETS)]
-        self.planets = [shapes.Circle(cx, cy, 8, color=(255,255,255,0), batch=batch)
-                        for i in range(self.PLANETS)]
-        self.ang = [random.uniform(0, math.tau) for _ in range(self.PLANETS)]
-
-    def update(self, dt, bands, palette, t, complexity=0.6, opacity=1.0, cx=None, cy=None):
-        if cx is None: cx, cy = WINDOW_W//2, WINDOW_H//2
-        bass = float(bands[0] + bands[1]) * 0.5
-        visible = 2 + int(complexity * (self.PLANETS - 2))
-        # Güneş
-        self.sun.x = cx; self.sun.y = cy
-        self.sun.radius = 16 + bass * 30
-        self.sun.color = palette.get(0, alpha=min(1.0, 0.6 + bass*0.4) * opacity)
-        for i in range(self.PLANETS):
-            orbit = self.orbits[i]; planet = self.planets[i]
-            if i >= visible:
-                orbit.color = (0,0,0,0); planet.color = (0,0,0,0); continue
-            r = 60 + i * 55
-            spd = (0.8 - i*0.08) * (1 + bass)
-            self.ang[i] += dt * spd
-            px = cx + math.cos(self.ang[i]) * r
-            py = cy + math.sin(self.ang[i]) * r
-            energy = float(bands[i % BANDS])
-            orbit.x = cx; orbit.y = cy; orbit.radius = r
-            orbit.color = palette.get(1, alpha=0.12 * opacity)
-            planet.x = float(px); planet.y = float(py)
-            planet.radius = 5 + energy * 14
-            planet.color = palette.get((i % 3)+1, alpha=min(1.0, 0.5 + energy*0.5) * opacity)
-
-    def delete(self):
-        self.sun.delete()
-        for o in self.orbits: o.delete()
-        for p in self.planets: p.delete()
-
-
-# Sürpriz katman: yukarıdan düşen şekiller (event tetiklemeli)
-class ShapeRainLayer:
-    POOL = 50
-    def __init__(self, batch):
-        self.batch = batch
-        self.items = []
-        for _ in range(self.POOL):
-            kind = random.choice(["circle","star","tri"])
-            if kind == "circle":
-                obj = shapes.Circle(0, -50, 6, color=(255,255,255,0), batch=batch)
-            elif kind == "star":
-                obj = shapes.Star(0, -50, 12, 5, num_spikes=5, color=(255,255,255,0), batch=batch)
-            else:
-                obj = shapes.Star(0, -50, 12, 6, num_spikes=3, color=(255,255,255,0), batch=batch)
-            self.items.append({"obj": obj, "active": False, "kind": kind,
-                               "x": 0, "y": -50, "vy": 0, "vr": 0,
-                               "angle": 0, "size": 10, "col": 0})
-        self.active = False
-        self._spawn_acc = 0.0
-
-    def burst(self, n=24):
-        """Bir grup şekli düşmeye başlat."""
-        self.active = True
-        spawned = 0
-        for it in self.items:
-            if it["active"]: continue
-            if spawned >= n: break
-            it["active"] = True
-            it["x"]     = random.uniform(40, WINDOW_W-40)
-            it["y"]     = WINDOW_H + random.uniform(20, 200)
-            it["vy"]    = random.uniform(120, 300)
-            it["vr"]    = random.uniform(-180, 180)
-            it["angle"] = random.uniform(0, 360)
-            it["size"]  = random.uniform(8, 26)
-            it["col"]   = random.randint(0, 3)
-            spawned += 1
-
-    def update(self, dt, bands, palette, t):
-        any_active = False
-        for it in self.items:
-            obj = it["obj"]
-            if not it["active"]:
-                obj.color = (0,0,0,0); continue
-            any_active = True
-            it["y"]     -= it["vy"] * dt
-            it["angle"] += it["vr"] * dt
-            it["vy"]    += 200 * dt    # yerçekimi
-            if it["y"] < -40:
-                it["active"] = False
-                obj.color = (0,0,0,0); continue
-            energy = float(bands[1])
-            sz = it["size"] * (1 + energy * 0.8)
-            obj.x = float(it["x"]); obj.y = float(it["y"])
-            try: obj.rotation = float(it["angle"])
-            except: pass
-            if isinstance(obj, shapes.Circle):
-                obj.radius = sz
-            elif isinstance(obj, shapes.Star):
-                obj.outer_radius = sz
-                obj.inner_radius = sz * (0.5 if it["kind"]=="tri" else 0.42)
-            c = palette.get(it["col"], alpha=0.85)
-            try: obj.color = c
-            except: pass
-        self.active = any_active
-
-    def delete(self):
-        for it in self.items: it["obj"].delete()
-
-
-# Katman 4: Parçacık sistemi — high_mid + presence + brilliance
-class ParticleLayer:
-    MAX = 300
-
-    def __init__(self, batch):
-        self.batch     = batch
-        self.particles = []
-        self._pool     = []
-        cx, cy = WINDOW_W//2, WINDOW_H//2
-        for _ in range(self.MAX):
-            p = shapes.Circle(cx, cy, 2, color=(255,255,255,0), batch=batch)
-            self._pool.append({
-                "obj": p, "x": cx, "y": cy,
-                "vx": 0.0, "vy": 0.0,
-                "life": 0.0, "max_life": 1.0,
-                "r": 2.0, "alive": False,
-                "col_idx": 0,
-            })
-
-    def _spawn(self, n, bands, palette):
-        cx, cy = WINDOW_W//2, WINDOW_H//2
-        energy = float(bands[4] + bands[5] + bands[6])
-        for p in self._pool:
-            if p["alive"]: continue
-            if n <= 0: break
-            angle    = random.uniform(0, math.tau)
-            speed    = random.uniform(100, 320) * (1 + energy * 3)
-            p["x"]   = cx + random.uniform(-20, 20)
-            p["y"]   = cy + random.uniform(-20, 20)
-            p["vx"]  = math.cos(angle) * speed
-            p["vy"]  = math.sin(angle) * speed
-            p["life"]     = 0.0
-            p["max_life"] = random.uniform(0.6, 2.0)
-            p["r"]        = random.uniform(2.0, 8.0) * (1 + energy * 1.5)
-            p["alive"]    = True
-            p["col_idx"]  = random.randint(0, 3)
-            n -= 1
-
-    def update(self, dt, bands, palette, t, rate_mult=1.0, opacity=1.0,
-               mouse=None, mouse_mode=0):
-        high_energy = float(bands[4] + bands[5] + bands[6]) / 3.0
-        spawn_n = int(high_energy * 25 * rate_mult + float(bands[1]) * 10)
-        if spawn_n > 0:
-            self._spawn(spawn_n, bands, palette)
-
-        mx, my = (mouse if mouse else (None, None))
-
-        for p in self._pool:
-            if not p["alive"]: continue
-            p["life"] += dt
-            if p["life"] >= p["max_life"]:
-                p["alive"] = False
-                p["obj"].color = (0, 0, 0, 0)
-                continue
-            prog  = p["life"] / p["max_life"]
-            alpha = int((1.0 - prog) * 220)
-
-            # Fare etkilesimi: mode 1=cek, 2=it
-            if mx is not None and mouse_mode != 0:
-                dx = mx - p["x"]; dy = my - p["y"]
-                dist2 = dx*dx + dy*dy + 100
-                dist  = math.sqrt(dist2)
-                if dist < 350:
-                    force = 9000 / dist2
-                    fx = (dx / dist) * force
-                    fy = (dy / dist) * force
-                    if mouse_mode == 1:    # cek
-                        p["vx"] += fx * dt * 60
-                        p["vy"] += fy * dt * 60
-                    else:                   # it
-                        p["vx"] -= fx * dt * 60
-                        p["vy"] -= fy * dt * 60
-
-            p["vx"] *= (1 - dt * 0.9)
-            p["vy"] *= (1 - dt * 0.9)
-            p["x"]  += p["vx"] * dt
-            p["y"]  += p["vy"] * dt
-            r     = p["r"] * (1.0 - prog * 0.6)
-            obj   = p["obj"]
-            obj.x = p["x"]
-            obj.y = p["y"]
-            obj.radius = max(0.5, r)
-            c = palette.get(p["col_idx"], alpha=(alpha/255) * opacity)
-            try: obj.color = c
-            except: pass
-
-    def delete(self):
-        for p in self._pool: p["obj"].delete()
-
-
-# Katman 5: Dalgalı çizgi (ses dalgası) — rms
-class WaveformLayer:
-    def __init__(self, batch):
-        self.batch  = batch
-        self.N      = 160
-        self.lines  = []
-        for i in range(self.N - 1):
-            l = shapes.Line(0,0,1,1, thickness=1, color=(200,200,255,60), batch=batch)
-            self.lines.append(l)
-        self._phase = 0.0
-
-    def update(self, dt, bands, palette, t, rms, amp_mult=1.0):
-        self._phase += dt * (3 + rms * 12)
-        mid   = float(bands[2] + bands[3])
-        high  = float(bands[4] + bands[5])
-        bass  = float(bands[1])
-        amp   = float((rms * 0.4 + mid * 0.35 + high * 0.25) * WINDOW_H * 0.35) * amp_mult
-        amp   = max(15, amp)
-        # Ust dalga
-        y_top = WINDOW_H * 0.82
-        # Alt dalga (yansima)
-        y_bot = WINDOW_H * 0.18
-        xs = [int(WINDOW_W * i / (self.N - 1)) for i in range(self.N)]
-        c_top = palette.get(2, alpha=min(1.0, 0.3 + rms * 0.6))
-        c_bot = palette.get(3, alpha=min(1.0, 0.2 + bass * 0.5))
-        half = len(self.lines) // 2
-        for i in range(min(half, self.N - 1)):
-            phase2 = self._phase + (i / self.N) * math.pi * 5
-            dy = math.sin(phase2) * amp * 0.55
-            dy += math.sin(phase2 * 2.1 + 0.8) * amp * 0.3
-            dy += math.sin(phase2 * 0.5 + 2.1) * amp * 0.15
-            # Ust
-            self.lines[i].x  = xs[i];   self.lines[i].y  = y_top + dy
-            self.lines[i].x2 = xs[i+1]; self.lines[i].y2 = y_top + dy * 0.9
-            try: self.lines[i].color = c_top
-            except: pass
-        for i in range(min(half, self.N - 1)):
-            phase2 = self._phase * 0.7 + (i / self.N) * math.pi * 4
-            dy = math.sin(phase2) * amp * 0.45
-            dy += math.sin(phase2 * 1.7 + 1.2) * amp * 0.35
-            j = half + i
-            if j < len(self.lines):
-                self.lines[j].x  = xs[i];   self.lines[j].y  = y_bot - dy
-                self.lines[j].x2 = xs[i+1]; self.lines[j].y2 = y_bot - dy * 0.9
-                try: self.lines[j].color = c_bot
-                except: pass
-
-    # Ikinci dalga (yansıma)
-    def update2(self, dt, bands, palette, t, rms):
-        pass  # Tek dalga yeterli
-
+import lyrics as lyrics_mod
+from audio_analyzer import AudioAnalyzer, BANDS
+from audio_model import AudioTap, AudioLatentModel, MODEL_PATH
+from director import LocalDirector
+from layers import (WINDOW_W, WINDOW_H, clamp8, ShockwaveLayer, ConstellationLayer, ShapeRainLayer,
+                    ParticleLayer, LissajousLayer, RibbonLayer, SpiralLayer, HelixLayer, TunnelLayer,
+                    BurstRaysLayer, GridWaveLayer, OrbitsLayer)
+from neural_bg import NeuralBackground
+from palette import Palette
+from recorder import VideoRecorder
+from settings_menu import SettingsMenu
+
+TARGET_FPS = 60
+SCENE_APPLY_TIMEOUT = 2.5     # beat senkronunda sahne değişimi en fazla bu kadar bekler (sn)
 
 # ── Ana Pencere ───────────────────────────────────────────────────────────────
 class VisualizerWindow(pyglet.window.Window):
-    def __init__(self):
+    def __init__(self, cfg=None):
+        self.cfg = cfg if cfg is not None else config.load()
         super().__init__(
-            width=WINDOW_W, height=WINDOW_H,
+            width=self.cfg["width"], height=self.cfg["height"],
             caption="AI Music Visualizer",
             resizable=True, vsync=True,
         )
         self.set_minimum_size(640, 360)
+        if self.cfg["fullscreen"]:
+            self.set_fullscreen(True)
 
         # Blending aktif — additive glow için
         pyglet.gl.glEnable(pyglet.gl.GL_BLEND)
 
-        self.audio       = AudioAnalyzer()
+        self.audio       = AudioAnalyzer(device_hint=self.cfg["device"])
         self.dir_queue   = queue.Queue(maxsize=8)
         self.ai = LocalDirector(self.audio, self.dir_queue)
         self.palette     = Palette()
-        # Compose parametreleri (defaults)
-        self.mandala_speed  = 1.0
+        self.palette.drift_speed = self.cfg["palette_drift"]
         self.particle_rate  = 1.0
-        self.wave_amp       = 1.0
-        self.radial_bars    = 64
-        self._tgt_mandala_speed = 1.0
         self._tgt_particle_rate = 1.0
-        self._tgt_wave_amp      = 1.0
+
+        # Ritim durumu (beat ızgarası + bölümler)
+        self.beat_phase   = 0.0
+        self.beat_conf    = 0.0
+        self.beat_count   = 0         # ölçü içindeki konum (0 = ölçü başı)
+        self.section      = "intro"
+        self._pending_dir = None      # beat senkronunda bir sonraki ölçü başını bekleyen sahne
+        self._diff_bar    = 0         # difüzyon sahnesi için ölçü sayacı
+        self._pending_t   = 0.0
+
+        # Kayıt + ayarlar menüsü
+        self.recorder = VideoRecorder(config.resolve_dir(self.cfg["record_dir"]),
+                                      fps=self.cfg["record_fps"], crf=self.cfg["record_crf"])
+        self.settings = SettingsMenu(self.cfg, self._on_setting)
+        self._rec_msg_t = 0.0
 
         self.batch  = pyglet.graphics.Batch()
         self.batch2 = pyglet.graphics.Batch()  # HUD
@@ -1446,10 +92,14 @@ class VisualizerWindow(pyglet.window.Window):
         # Difüzyon katmanı (rüya modu → nesneli sahneler). torch/CUDA yoksa kapalı.
         self.diff = None
         self.diff_on = False
-        self._diff_tex = None
+        # Çapraz geçiş: yeni kare bir öncekinin üzerine opaklığı artarak gelir (iki sprite)
+        self._diff_sprites = []       # [eski, yeni]
         self._diff_seen = -1
+        self._diff_t = 0.0            # yeni karenin geldiği an
+        self._diff_fade = 0.25        # geçiş süresi (difüzyon hızına göre ayarlanır)
         if self.neural is not None and diffusion_layer.available():
             self.diff = diffusion_layer.DiffusionLayer(tap=None)
+            self.diff.valence_bias = self.cfg["diff_valence_bias"]
             self.diff.start()
             self.diff_on = True
             print("[Difüzyon] Arka planda yükleniyor...")
@@ -1471,8 +121,14 @@ class VisualizerWindow(pyglet.window.Window):
         else:
             print("[Model] models/audio_latent.onnx yok — bant tabanlı latent kullanılıyor")
         self.use_model = self.audio_model is not None
+        self.lyrics = None
         if self.diff is not None:
             self.diff.tap = self.tap          # CLAP kavram seçimi için ham ses
+            # Şarkı sözü dinleyici (Whisper) — difüzyonla aynı ortamı ister
+            # transformers import'u thread-safe değil: difüzyon yüklenmeden başlatılmaz (bkz. update)
+            self.lyrics = lyrics_mod.LyricsListener(self.tap, model=self.cfg["lyrics_model"])
+            self.lyrics.enabled = self.cfg["lyrics"]
+            self.diff.lyrics = self.lyrics
 
         # Fade overlay
         self.fade = shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H,
@@ -1543,7 +199,7 @@ class VisualizerWindow(pyglet.window.Window):
         self.auto_scenes   = True
         self.scene_idx     = 3          # "Tam" ile başla
         self.scene_timer   = 0.0
-        self.scene_dur     = 22.0       # sahne süresi (sn)
+        self.scene_dur     = self.cfg["scene_duration"]   # sahne süresi (sn)
         self._apply_scene(self.scene_idx)
 
         # ── Drop algılama ──────────────────────────────────────────
@@ -1553,9 +209,9 @@ class VisualizerWindow(pyglet.window.Window):
         # Etkileşim state
         self.mouse_pos    = None
         self.mouse_mode   = 0       # 0=off, 1=cek, 2=it
-        self.show_hud     = True
+        self.show_hud     = self.cfg["show_hud"]
         self.show_help    = False
-        self.sensitivity  = 1.0
+        self.sensitivity  = self.cfg["sensitivity"]
         self._prev_bass   = 0.0
 
         # HUD
@@ -1565,39 +221,46 @@ class VisualizerWindow(pyglet.window.Window):
         self.mood_lbl = pyglet.text.Label("Baslatiliyor...", x=14, y=14,
                                           font_name="Consolas", font_size=14,
                                           color=(150,200,255,210), batch=self.batch2)
-        self.hint_lbl = pyglet.text.Label("[H] yardim  [TAB] HUD",
+        self.hint_lbl = pyglet.text.Label("[H] yardım  [S] ayarlar  [F9] kayıt  [TAB] HUD",
                                           x=14, y=40, font_name="Consolas",
                                           font_size=10, color=(120,130,150,140),
                                           batch=self.batch2)
         self.scene_lbl = pyglet.text.Label("", x=14, y=66,
                                            font_name="Consolas", font_size=12,
                                            color=(255,200,120,200), batch=self.batch2)
-        # Yardim overlay (ayri batch)
+        # Yardım overlay (ayrı batch, iki sütun)
         self.help_batch = pyglet.graphics.Batch()
-        help_text = ("KONTROLLER\n\n"
-                     "1-5    Katmanlari ac/kapa\n"
-                     "       (1:dalga 2:radyal 3:mandala\n"
-                     "        4:yildiz 5:parcacik)\n"
-                     "M      Fare modu (kapali/cek/it)\n"
-                     "+/-    Hassasiyet\n"
+        help_left = ("GENEL\n\n"
+                     "S      Ayarlar menüsü\n"
+                     "F9     Video kaydı başlat/durdur\n"
                      "F      Tam ekran\n"
-                     "SPACE  Renk paletini karistir\n"
-                     "G      Neural arka plan ac/kapa\n"
-                     "B      Preset katmanlari ac/kapa\n"
-                     "V      Yeni neural stil\n"
-                     "K      Bu stili favorilere kaydet\n"
-                     "L      Stili kilitle/coz\n"
-                     "X      Ses modelini ac/kapa\n"
-                     "C      Canli ozellik kaydi (egitim)\n"
-                     "TAB    HUD goster/gizle\n"
-                     "H      Bu menu\n"
-                     "ESC/Q  Cikis")
-        self.help_bg = shapes.Rectangle(0, 0, 420, 450,
+                     "TAB    HUD göster/gizle\n"
+                     "+/-    Hassasiyet\n"
+                     "SPACE  Renk paletini karıştır\n"
+                     "M      Fare modu (kapalı/çek/it)\n"
+                     "H      Bu menü\n"
+                     "ESC/Q  Çıkış\n\n"
+                     "SAHNE / KATMAN\n\n"
+                     "A      Otomatik sahne aç/kapa\n"
+                     "N      Sonraki sahne\n"
+                     "R      Şekil yağmuru\n"
+                     "1-0,O  Katmanları aç/kapa")
+        help_right = ("NEURAL / MODEL\n\n"
+                      "G      Neural arka plan aç/kapa\n"
+                      "B      Preset katmanları aç/kapa\n"
+                      "V      Yeni neural stil\n"
+                      "K      Stili favorilere kaydet\n"
+                      "L      Stili kilitle/çöz\n"
+                      "X      Ses modeli (rüya modu)\n"
+                      "D      Difüzyon katmanı aç/kapa\n"
+                      "[ / ]  Difüzyon gürültüsü\n"
+                      "C      Canlı özellik kaydı (eğitim)")
+        self.help_bg = shapes.Rectangle(0, 0, 780, 380,
                                         color=(10, 12, 22, 230), batch=self.help_batch)
-        self.help_lbl = pyglet.text.Label(help_text, x=0, y=0,
-                                          font_name="Consolas", font_size=13,
-                                          color=(210,220,240,255), multiline=True,
-                                          width=400, batch=self.help_batch)
+        self.help_lbls = [pyglet.text.Label(txt, x=0, y=0, font_name="Consolas", font_size=12,
+                                            color=(210, 220, 240, 255), multiline=True,
+                                            width=370, batch=self.help_batch)
+                          for txt in (help_left, help_right)]
 
         self.t       = 0.0
         self._fps_dt = 0.0; self._fps_fr = 0; self._fps_v = 0.0
@@ -1620,17 +283,15 @@ class VisualizerWindow(pyglet.window.Window):
                 d = self.dir_queue.get_nowait()
                 self.palette.set(d)
                 self.mood_lbl.text = f"Mood: {d.get('mood','?')}"
-                # AI sahne seçtiyse uygula (otomatik rotasyonu devralır)
+                # Sahne değişimi: beat kilitliyse bir sonraki ölçü başını bekler
                 scene = d.get("scene")
-                if scene and scene in self.ai_scene_map:
-                    self.ai_driving = True
-                    self.auto_scenes = False
-                    layers = self.ai_scene_map[scene]
-                    for key in self.layers_on:
-                        self.layers_on[key] = (key in layers)
-                    self._cur_scene_name = scene
-                    mode = "AUTO"
-                    self.scene_lbl.text = f"Sahne: {scene} [{mode}]"
+                if scene and scene in self.ai_scene_map and scene != self._cur_scene_name:
+                    if self._beat_locked():
+                        if self._pending_dir is None:
+                            self._pending_t = self.t
+                        self._pending_dir = scene
+                    else:
+                        self._set_director_scene(scene)
                 # Karmaşıklık & hız hedefleri
                 self._tgt_complexity = float(d.get("complexity", 0.6))
                 self._tgt_speed      = float(d.get("speed", 1.0))
@@ -1661,12 +322,51 @@ class VisualizerWindow(pyglet.window.Window):
                 self.vis_bands[i] += (target - self.vis_bands[i]) * min(1.0, dt * 7)   # bırakma
         bands = self.vis_bands
 
-        # Beat algıla — bass yükseliş anı → flash + zoom pulse
+        # ── Ritim: beat ızgarası + bölümler ───────────────────────
+        beats, sections, self.beat_phase, self.beat_conf, bpm, self.section = self.audio.rhythm()
+        downbeat = False
         bass = float(bands_raw[1])
-        if bass - self._prev_bass > 0.25 and bass > 0.4:
-            self._flash_intensity = min(1.0, self._flash_intensity + bass * 0.6)
-            self._zoom_pulse = min(0.10, self._zoom_pulse + bass * 0.06)  # zoom darbesi
+        fl, zp = self.cfg["flash"], self.cfg["zoom_pulse"]
+        if self._beat_locked():
+            # Izgaradan gelen beat'ler: vuruşla aynı anda, ölçü başı daha güçlü
+            for _, idx, down in beats:
+                self.beat_count = 0 if down else self.beat_count + 1
+                k = (1.0 if down else 0.55) * (0.5 + min(1.0, bass))
+                self._flash_intensity = min(1.0, self._flash_intensity + 0.45 * k * fl)
+                self._zoom_pulse = min(0.10, self._zoom_pulse + 0.045 * k * zp)
+                downbeat |= down
+        else:
+            # Kilit yok: bas yükselişi (eski yöntem)
+            if bass - self._prev_bass > 0.25 and bass > 0.4:
+                self._flash_intensity = min(1.0, self._flash_intensity + bass * 0.6 * fl)
+                self._zoom_pulse = min(0.10, self._zoom_pulse + bass * 0.06 * zp)
         self._prev_bass = bass
+
+        # Bekleyen sahne: ölçü başında (ya da zaman aşımında) uygula
+        if self._pending_dir is not None and (downbeat or not self._beat_locked()
+                                              or self.t - self._pending_t > SCENE_APPLY_TIMEOUT):
+            self._set_director_scene(self._pending_dir)
+            self._pending_dir = None
+
+        if self.cfg["section_detection"]:
+            for _, label, _ in sections:
+                self._on_section(label)
+
+        # Söz dinleyici: difüzyon yüklendikten (ya da düştükten) sonra başlar
+        if self.lyrics is not None and not self.lyrics.running and (self.diff.ready or self.diff.failed):
+            self.lyrics.start()
+
+        # Difüzyon: bölüm etiketi + her beat'te nabız + her N ölçüde yeni sahne
+        # (kilit yoksa katman kendi 3 sn zamanlayıcısını kullanır)
+        if self.diff is not None:
+            self.diff.section = self.section
+            if beats and self.diff_on and self.diff.ready and self._beat_locked():
+                self.diff.pulse()
+        if downbeat and self.diff_on and self.diff is not None and self.diff.ready:
+            self._diff_bar += 1
+            if self._diff_bar >= self.cfg["diff_bars"]:
+                self._diff_bar = 0
+                self.diff.request_scene()
         self._flash_intensity *= (1 - dt * 5.0)
         # Zoom pulse yumuşak sönüm (yaylı geri dönüş)
         self._zoom_pulse *= (1 - dt * 4.0)
@@ -1718,15 +418,23 @@ class VisualizerWindow(pyglet.window.Window):
                 self.neural.set_external_latent(None)
                 self.neural.set_dream(None)
             self.neural.update(dt, bands, rms_s, self._flash_intensity,
-                               palette=self.palette._draw, bg=self.palette.bg)
+                               palette=self.palette._draw, bg=self.palette.bg,
+                               downbeat=downbeat, quantize=self._beat_locked())
             n = self.neural
             if self.diff_on and self.diff.ready and n.dreaming and hasattr(n.dream, "va"):
                 self.diff.submit(n.cur, n.latent, n.dream.va)
             if n.dreaming and hasattr(n.dream, "mood"):
                 v, a = n.dream.va
                 txt = f"RÜYA · {n.dream.mood()}  (pozitiflik {v:+.2f}  enerji {a:+.2f})"
+                if self.diff_on and self.diff is not None and self.diff.va_eff is not None:
+                    dv, da = self.diff.va_eff                # difüzyonun kullandığı: model + CLAP
+                    txt += f"  dif:{dv:+.2f}/{da:+.2f}"
                 if self.diff_on and self.diff is not None and self.diff.concepts:
-                    txt += f"  · {self.diff.mood_name} · " + ", ".join(c for c, _ in self.diff.concepts)
+                    txt += (f"  · {self.diff.genre_name} · {self.diff.mood_name} · "
+                            + ", ".join(c for c, _ in self.diff.concepts))
+                    lo = self.lyrics.current_original() if self.lyrics is not None else None
+                    if self.diff.lyric_used and lo:
+                        txt += f'  ♪[{lo[1]}] "{" ".join(lo[0].split()[:14])}"'
                 self.scene_lbl.text = txt
             elif n.dreaming:
                 self.scene_lbl.text = "Neural RÜYA — model ne duyuyorsa o  [X: kapat]"
@@ -1780,7 +488,6 @@ class VisualizerWindow(pyglet.window.Window):
         if self._fps_dt >= 0.5:
             self._fps_v  = self._fps_fr / self._fps_dt
             self._fps_dt = 0.0; self._fps_fr = 0
-        snap = self.audio.snapshot()
         mode_txt = ["fare:kapali", "fare:cek", "fare:it"][self.mouse_mode]
         extra = ""
         if self.audio_model is not None:
@@ -1796,9 +503,20 @@ class VisualizerWindow(pyglet.window.Window):
             else:
                 extra += f"  DIF:{self.diff.fps:.0f}fps gurultu:{self.diff.noise}"
         if self.tap.recorder is not None:
-            extra += f"  ●REC({self.tap.recorder.saved_tracks})"
-        self.fps_lbl.text = (f"FPS:{self._fps_v:.0f}  RMS:{rms:.3f}  "
-                             f"BPM:{snap['bpm']:.0f}  x{self.sensitivity:.1f}  {mode_txt}{extra}")
+            extra += f"  ●ÖZELLİK({self.tap.recorder.saved_tracks})"
+        rec = self.recorder
+        if rec.active:
+            m, sec = divmod(int(rec.elapsed), 60)
+            extra += f"  ● KAYIT {m:02d}:{sec:02d}"
+        elif rec.status and self.t - self._rec_msg_t < 6:
+            extra += f"  [{rec.status}]"
+        if self._beat_locked():
+            dots = "".join("●" if i == self.beat_count % 4 else "○" for i in range(4))
+            beat_txt = f"BPM:{bpm:.0f} {dots}"
+        else:
+            beat_txt = f"BPM:{bpm:.0f}?"
+        self.fps_lbl.text = (f"FPS:{self._fps_v:.0f}  RMS:{rms:.3f}  {beat_txt}  "
+                             f"bölüm:{self.section}  x{self.sensitivity:.1f}  {mode_txt}{extra}")
         self.fps_lbl.y = self.height - 24
 
     def on_draw(self):
@@ -1840,6 +558,10 @@ class VisualizerWindow(pyglet.window.Window):
             self.flash.height = self.height
             self.flash.draw()
 
+        # Kayıt: HUD'suz kare (ayarlardan HUD dahil edilebilir)
+        if self.recorder.active and not self.cfg["record_hud"]:
+            self._capture()
+
         # 4) HUD — normal blend
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
         if self.show_hud:
@@ -1847,11 +569,26 @@ class VisualizerWindow(pyglet.window.Window):
 
         # 5) Yardım menüsü
         if self.show_help:
-            self.help_bg.x  = self.width // 2 - 210
-            self.help_bg.y  = self.height // 2 - 225
-            self.help_lbl.x = self.width // 2 - 190
-            self.help_lbl.y = self.height // 2 + 205
+            self.help_bg.x  = self.width // 2 - 390
+            self.help_bg.y  = self.height // 2 - 190
+            for i, lbl in enumerate(self.help_lbls):
+                lbl.x = self.width // 2 - 370 + i * 390
+                lbl.y = self.height // 2 + 165
             self.help_batch.draw()
+
+        # 6) Ayarlar menüsü
+        self.settings.draw(self.width, self.height)
+
+        if self.recorder.active and self.cfg["record_hud"]:
+            self._capture()
+
+    def _capture(self):
+        w, h = self.get_framebuffer_size()
+        if (w - w % 2, h - h % 2) != tuple(self.recorder.size):
+            print("[Kayıt] Pencere boyutu değişti — kayıt durduruldu")
+            self._toggle_recording()
+            return
+        self.recorder.capture(pyglet.gl)
 
     def on_resize(self, w, h):
         super().on_resize(w, h)
@@ -1868,7 +605,13 @@ class VisualizerWindow(pyglet.window.Window):
 
     def on_key_press(self, sym, mod):
         key = pyglet.window.key
-        if sym in (key.ESCAPE, key.Q):
+        if self.settings.on_key(sym):
+            return pyglet.event.EVENT_HANDLED
+        if sym == key.S:
+            self.settings.toggle()
+        elif sym == key.F9:
+            self._toggle_recording()
+        elif sym in (key.ESCAPE, key.Q):
             self.close()
         elif sym == key._1: self.layers_on["ribbon"] = not self.layers_on["ribbon"]
         elif sym == key._2: self.layers_on["spiral"] = not self.layers_on["spiral"]
@@ -1884,15 +627,18 @@ class VisualizerWindow(pyglet.window.Window):
         elif sym == key.M:
             self.mouse_mode = (self.mouse_mode + 1) % 3
         elif sym in (key.PLUS, key.EQUAL, key.NUM_ADD):
-            self.sensitivity = min(3.0, self.sensitivity + 0.1)
+            self.sensitivity = round(min(3.0, self.sensitivity + 0.1), 2)
+            self.cfg["sensitivity"] = self.sensitivity
         elif sym in (key.MINUS, key.NUM_SUBTRACT):
-            self.sensitivity = max(0.2, self.sensitivity - 0.1)
+            self.sensitivity = round(max(0.2, self.sensitivity - 0.1), 2)
+            self.cfg["sensitivity"] = self.sensitivity
         elif sym == key.F:
             self.set_fullscreen(not self.fullscreen)
         elif sym == key.SPACE:
             self.palette.randomize()
         elif sym == key.TAB:
             self.show_hud = not self.show_hud
+            self.cfg["show_hud"] = self.show_hud
         elif sym == key.H:
             self.show_help = not self.show_help
         elif sym == key.A:
@@ -1929,7 +675,9 @@ class VisualizerWindow(pyglet.window.Window):
             self.diff.noise = min(950, self.diff.noise + 50)
 
     def _draw_diffusion(self):
-        """Son difüzyon karesini ekranı kaplayacak şekilde çizer. Kare yoksa False."""
+        """Son difüzyon karesini ekranı kaplayacak şekilde çizer; yeni kare öncekinin
+        üzerine çapraz geçişle gelir (difüzyon ~5-15 FPS, ekran 60 FPS → takılma olmaz).
+        Kare yoksa False."""
         n = self.neural
         if not (self.diff_on and self.diff is not None and self.diff.ready and n.dreaming):
             return False
@@ -1939,13 +687,26 @@ class VisualizerWindow(pyglet.window.Window):
         if fid != self._diff_seen:
             h, w = frame.shape[:2]
             img = pyglet.image.ImageData(w, h, "RGB", frame.tobytes(), pitch=-w * 3)
-            self._diff_tex = img.get_texture()
+            spr = pyglet.sprite.Sprite(img.get_texture())
+            if len(self._diff_sprites) == 2:
+                self._diff_sprites[0].delete()
+            self._diff_sprites = (self._diff_sprites + [spr])[-2:]
             self._diff_seen = fid
-        tex = self._diff_tex
-        sc = max(self.width / tex.width, self.height / tex.height)      # ekranı kapla (kenarlar kırpılır)
-        dw, dh = tex.width * sc, tex.height * sc
-        pyglet.gl.glBlendFunc(pyglet.gl.GL_ONE, pyglet.gl.GL_ZERO)
-        tex.blit((self.width - dw) / 2, (self.height - dh) / 2, width=dw, height=dh)
+            self._diff_t = self.t
+            # Geçiş ≈ iki kare arası süre: sürekli akış, ama yavaş üretimde de bekletmez
+            self._diff_fade = min(0.5, max(0.08, 1.0 / max(self.diff.fps, 1e-3)))
+        a = min(1.0, (self.t - self._diff_t) / self._diff_fade)
+        if a >= 1.0 and len(self._diff_sprites) == 2:
+            self._diff_sprites[0].delete()
+            self._diff_sprites = self._diff_sprites[1:]
+        two = len(self._diff_sprites) == 2
+        for i, spr in enumerate(self._diff_sprites):
+            tex = spr.image
+            sc = max(self.width / tex.width, self.height / tex.height)   # ekranı kapla (kenarlar kırpılır)
+            spr.update(x=(self.width - tex.width * sc) / 2, y=(self.height - tex.height * sc) / 2, scale=sc)
+            spr.opacity = int(255 * a) if (two and i == 1) else 255
+        for spr in self._diff_sprites:
+            spr.draw()
         return True
 
     def _clear_layer(self, layer):
@@ -1972,6 +733,72 @@ class VisualizerWindow(pyglet.window.Window):
                     hide(p["obj"]); p["alive"] = False
         except Exception:
             pass
+
+    # ── Ritim yardımcıları ──
+    def _beat_locked(self):
+        return self.cfg["beat_sync"] and self.beat_conf >= 0.4
+
+    def _set_director_scene(self, scene):
+        """Direktörün seçtiği sahneyi uygula (otomatik rotasyonu devralır)."""
+        self.ai_driving = True
+        self.auto_scenes = False
+        layers = self.ai_scene_map[scene]
+        for key in self.layers_on:
+            self.layers_on[key] = (key in layers)
+        self._cur_scene_name = scene
+        if not (self.neural_on and self.neural.dreaming):
+            self.scene_lbl.text = f"Sahne: {scene} [AUTO]"
+
+    def _on_section(self, label):
+        """Şarkıda yeni bölüm: drop → özel an, diğerleri → yeni neural stil + sahne."""
+        print(f"[Bölüm] {label}")
+        if self.diff_on and self.diff is not None and self.diff.ready:
+            self.diff.request_scene()
+        if label == "intro":
+            return
+        if label == "drop":
+            if self._drop_cooldown <= 0:
+                self._trigger_drop(max(0.6, float(np.mean(self.vis_bands))))
+                self._drop_cooldown = 4.0
+            return
+        if self.neural_on and not self.neural.locked and not self.neural.dreaming:
+            self.neural.request_style(fast=(label == "breakdown"))
+        if self.auto_scenes:
+            self.scene_timer = 0.0
+            self.scene_idx = (self.scene_idx + 1) % len(self.scenes)
+            self._apply_scene(self.scene_idx)
+
+    # ── Ayarlar / kayıt ──
+    def _on_setting(self, key, value):
+        if key == "sensitivity":
+            self.sensitivity = value
+        elif key == "palette_drift":
+            self.palette.drift_speed = value
+        elif key == "scene_duration":
+            self.scene_dur = value
+        elif key == "show_hud":
+            self.show_hud = value
+        elif key == "lyrics" and self.lyrics is not None:
+            self.lyrics.enabled = value
+        elif key == "diff_valence_bias" and self.diff is not None:
+            self.diff.valence_bias = value
+            self.diff.request_scene()
+        elif key == "record_fps" and not self.recorder.active:
+            self.recorder.fps = value
+        elif key == "record_crf" and not self.recorder.active:
+            self.recorder.crf = value
+
+    def _toggle_recording(self):
+        rec = self.recorder
+        if rec.active:
+            self.audio.recorder = None
+            rec.stop()
+        else:
+            rec.fps, rec.crf = self.cfg["record_fps"], self.cfg["record_crf"]
+            w, h = self.get_framebuffer_size()
+            if rec.start(w, h, self.audio.sample_rate, self.audio.channels):
+                self.audio.recorder = rec
+        self._rec_msg_t = self.t
 
     def _apply_scene(self, idx):
         """Sahnenin katmanlarını aç, diğerlerini kapat."""
@@ -2000,6 +827,11 @@ class VisualizerWindow(pyglet.window.Window):
 
     def on_close(self):
         print("[App] Kapatiliyor...")
+        if self.recorder.active:
+            self._toggle_recording()
+        if not self.fullscreen:
+            self.cfg["width"], self.cfg["height"] = self.width, self.height
+        config.save(self.cfg)
         self.ai.stop()
         self.audio.stop()
         self.tap.stop()          # açık kayıt varsa son parçayı kaydeder
@@ -2007,13 +839,20 @@ class VisualizerWindow(pyglet.window.Window):
             self.audio_model.stop()
         if self.diff is not None:
             self.diff.stop()
+        if self.lyrics is not None:
+            self.lyrics.stop()
+        self.recorder.wait()
         pyglet.app.exit()
 
 
-if __name__ == "__main__":
+def main():
     print("=" * 52)
-    print("  AI Music Visualizer v2")
-    print("  DSP Layers + AI Palette + pyglet 2.x")
+    print("  AI Music Visualizer")
+    print("  Beat/bölüm analizi + neural arka plan + pyglet 2.x")
     print("=" * 52)
     VisualizerWindow()
     pyglet.app.run()
+
+
+if __name__ == "__main__":
+    main()

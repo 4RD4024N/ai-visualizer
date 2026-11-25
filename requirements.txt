@@ -14,5 +14,6 @@ pyglet>=2.0.0
 # Kendi ses modelimizi (models/audio_latent.onnx) çalıştırmak için
 onnxruntime>=1.17
 
-# Model eğitimi ayrı ortamda: bkz. train/requirements.txt
-# LM Studio (isteğe bağlı palet direktörü): https://lmstudio.ai
+# Video kaydı (F9) için ffmpeg PATH'te olmalı: winget install Gyan.FFmpeg
+# Geliştirme (test, paketleme): pip install -r requirements-dev.txt
+# Model eğitimi ve difüzyon katmanı ayrı ortamda: bkz. train/requirements.txt

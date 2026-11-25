@@ -127,3 +127,53 @@ MOOD_SD_TEXT = [m[1] for m in MOODS]
 
 CLAP_TEXT = [f"music that evokes {c}" for c in CONCEPTS]
 SD_TEXT = [f"{c}, artwork" for c in CONCEPTS]
+
+# Tür sözlüğü: müziğin türü → görsel üslup (sahnenin hangi estetikle çizileceği).
+# CLAP sıfır-atış sınıflandırma: ses, "<tür> music" metinleriyle karşılaştırılır.
+GENRES = [
+    ("rock", "gritty rock concert poster style, grainy film, high contrast"),
+    ("heavy metal", "heavy metal album cover art, dark fantasy, fire and steel"),
+    ("punk", "punk zine collage style, torn paper, xerox texture"),
+    ("pop", "glossy pop music video aesthetic, colorful, polished"),
+    ("dance pop", "vibrant dance pop aesthetic, glitter, colorful stage lights"),
+    ("electronic dance music", "EDM festival aesthetic, lasers, neon, crowd energy"),
+    ("techno", "dark techno aesthetic, industrial warehouse, strobe light, minimal"),
+    ("house music", "house music club aesthetic, warm disco lights, groove"),
+    ("drum and bass", "drum and bass aesthetic, speed lines, futuristic urban night"),
+    ("dubstep", "dubstep aesthetic, glitch, heavy bass shockwaves, neon purple"),
+    ("phonk", "phonk aesthetic, drifting cars, dark purple haze, memphis vibe"),
+    ("synthwave", "synthwave retro 80s aesthetic, neon grid, sunset, chrome"),
+    ("hip hop", "hip hop music video aesthetic, urban streets, bold graphics"),
+    ("trap", "trap music aesthetic, dark luxury, smoke, red and black"),
+    ("r&b", "smooth r&b aesthetic, soft neon, intimate night"),
+    ("jazz", "jazz album cover aesthetic, smoky club, blue note style"),
+    ("blues", "blues aesthetic, sepia, old guitar, southern night"),
+    ("classical", "classical painting style, baroque oil painting, grand hall"),
+    ("orchestral film score", "epic film poster aesthetic, cinematic lighting, grand scale"),
+    ("ambient", "ambient aesthetic, vast empty landscape, soft fog, minimal"),
+    ("lo-fi hip hop", "lo-fi anime aesthetic, cozy room, rainy window, pastel"),
+    ("folk", "folk art aesthetic, rustic, woodcut illustration, nature"),
+    ("acoustic", "acoustic aesthetic, warm daylight, natural, intimate"),
+    ("country", "country music aesthetic, open fields, golden hour, americana"),
+    ("reggae", "reggae aesthetic, tropical colors, sunshine, relaxed"),
+    ("latin", "latin music aesthetic, vibrant colors, dancing, summer heat"),
+    ("k-pop", "k-pop music video aesthetic, bright pastel, stylish, colorful sets"),
+    ("anatolian rock", "anatolian psychedelic rock aesthetic, 70s turkish poster, warm psychedelic colors"),
+    ("turkish pop", "turkish pop music video aesthetic, istanbul lights, colorful"),
+    ("arabesque", "arabesque aesthetic, melancholic night, istanbul, dramatic"),
+    ("indie", "indie music aesthetic, film photography, dreamy, faded colors"),
+    ("shoegaze", "shoegaze aesthetic, blurred dreamy haze, washed out colors"),
+    ("soundtrack video game", "video game concept art, fantasy world, vivid"),
+]
+GENRE_CLAP_TEXT = [f"{g[0]} music" for g in GENRES]
+GENRE_SD_TEXT = [g[1] for g in GENRES]
+
+# Bölüm (structure.py etiketi) → sahnenin anı
+SECTION_SD_TEXT = {
+    "drop": "explosive climax moment, maximum intensity, bursting energy",
+    "chorus": "grand peak moment, wide and bright, full of energy",
+    "verse": "",
+    "breakdown": "sparse quiet moment, minimal, lots of empty space",
+    "calm": "still and minimal, soft and quiet",
+    "intro": "opening establishing shot",
+}
