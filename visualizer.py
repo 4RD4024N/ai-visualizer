@@ -12,9 +12,12 @@ import threading
 import queue
 import time
 import math
-import json
+import os
 import random
-import urllib.request
+
+from neural_bg import NeuralBackground
+from audio_model import AudioTap, AudioLatentModel, MODEL_PATH
+import diffusion_layer
 
 # ── Sabitler ────────────────────────────────────────────────────────────────
 CHUNK       = 1024
@@ -27,21 +30,6 @@ WINDOW_H    = 720
 
 BAND_NAMES  = ["sub_bass","bass","low_mid","mid","high_mid","presence","brilliance","air"]
 BAND_RANGES = [(20,60),(60,250),(250,500),(500,2000),(2000,4000),(4000,6000),(6000,12000),(12000,20000)]
-LM_BASE_URL = "http://localhost:1234/v1"
-
-AI_PROMPT = """You are the creative director of a music visualizer. Based on the audio analysis, choose the animation scene and look. Respond with ONLY a JSON object, no explanation, no markdown.
-
-Required keys:
-- scene: pick ONE that fits the music character: "flow" (smooth/melodic), "galaxy" (spacious/epic), "web" (intricate/glitchy), "cosmic" (dreamy/ambient), "storm" (aggressive/intense), "minimal" (calm/sparse), "full" (high energy/everything)
-- complexity: 0.0-1.0 (sparse to dense/intricate). High for busy music, low for calm.
-- speed: 0.5-2.0 animation speed. High for fast/energetic music.
-- palette: array of 4 colors, each {"r":0-1,"g":0-1,"b":0-1}. Vivid neon for energy, cool pastel for calm.
-- bg_r,bg_g,bg_b: 0.0-0.06 dark background
-- mood: energetic/calm/dark/ethereal/aggressive/dreamy
-- shape_rain: true ONLY on very high energy moments, else false
-
-Map from audio: high rms_avg+dynamics+bpm=energetic scenes(full/storm)+vivid+fast. low=calm scenes(minimal/cosmic)+pastel+slow. high spectral_balance.low(bass)=storm/galaxy. high spectral_balance.high(treble)=web/flow. Always derive from the actual numbers, vary your choices."""
-
 # ── Ses Analizi ──────────────────────────────────────────────────────────────
 class AudioAnalyzer:
     def __init__(self):
@@ -65,6 +53,7 @@ class AudioAnalyzer:
         self._stat_rms    = 0.0
         self._rms_hist    = []                # son ~3sn RMS (dinamik aralık için)
         self._flux_hist   = []                # spektral akış geçmişi
+        self.tap          = None              # AudioTap: ses modeli + canlı kayıt için ham ses
 
     def _find_loopback(self):
         devices  = sd.query_devices()
@@ -120,6 +109,8 @@ class AudioAnalyzer:
 
     def _cb(self, indata, frames, time_info, status):
         s = indata[:, 0].copy()
+        if self.tap is not None:
+            self.tap.push(s, self._sample_rate)
         with self.lock:
             self.buffer = np.roll(self.buffer, -len(s))
             self.buffer[-len(s):] = s
@@ -268,7 +259,7 @@ class AudioAnalyzer:
             self.stream.close()
 
 
-# ── AI Palette Director ───────────────────────────────────────────────────────
+# ── Yerel Direktör (LLM yok) ──────────────────────────────────────────────────
 DEFAULT_PALETTE = [
     (0.2, 0.4, 1.0),
     (0.9, 0.1, 0.8),
@@ -276,123 +267,94 @@ DEFAULT_PALETTE = [
     (0.1, 0.9, 0.5),
 ]
 
-def _parse_json(raw):
-    import re
-    raw = raw.strip()
-    if "</think>" in raw:
-        raw = raw[raw.rfind("</think>") + len("</think>"):]
-    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-    if not raw: return None
-    if "```" in raw:
-        for part in raw.split("```")[1::2]:
-            part = part.lstrip("json").strip()
-            if part.startswith("{"): raw = part; break
-    if not raw.startswith("{"):
-        idx = raw.find("{")
-        if idx >= 0: raw = raw[idx:]
-        else: return None
-    depth, end = 0, -1
-    for i, ch in enumerate(raw):
-        if ch == "{": depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0: end = i; break
-    if end >= 0: raw = raw[:end+1]
-    raw = re.sub(r",\s*}", "}", raw)
-    raw = re.sub(r",\s*]", "]", raw)
-    try: return json.loads(raw)
-    except: return None
 
-def _lm_call(base_url, model, system_prompt, user_prompt, max_tokens=200, temperature=0.5):
-    """Genel LM Studio HTTP çağrısı."""
-    body = json.dumps({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "stream": False,
-    }).encode()
-    req = urllib.request.Request(
-        f"{base_url}/chat/completions", data=body,
-        headers={"Content-Type":"application/json","Authorization":"Bearer lm-studio"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=20) as r:
-        data = json.loads(r.read())
-    return data["choices"][0]["message"]["content"].strip()
+class LocalDirector:
+    """Ses istatistiklerinden sahne/palet/hız seçer — dış servis yok.
+    Çıktı formatı eski AIDirector ile aynı (dir_queue'ya dict)."""
+    INTERVAL = 3.0
 
-def _get_model(base_url):
-    req = urllib.request.Request(f"{base_url}/models",
-                                 headers={"Content-Type":"application/json"})
-    with urllib.request.urlopen(req, timeout=5) as r:
-        data = json.loads(r.read())
-    models = data.get("data", [])
-    if not models: raise RuntimeError("Model yok")
-    mid = models[0]["id"]
-    print(f"[AI] Model: {mid}")
-    return mid
-
-
-
-
-class AIDirector:
-    """Tek model — renk paleti + compose parametreleri (her 3sn)"""
     def __init__(self, audio, q):
         self.audio   = audio
         self.queue   = q
         self.running = False
-        self.model   = None
+        self._ref    = {"rms": 1e-3, "flux": 1e-3, "dyn": 1e-4}   # uyarlanır tavan
+        self._scene  = None
+        self._cand   = None
+        self._hue    = random.random()
 
     def start(self):
         self.running = True
         threading.Thread(target=self._loop, daemon=True).start()
 
+    def stop(self): self.running = False
+
+    def _norm(self, key, v):
+        # Yavaş sönen tepe değere göre 0-1 — cihaz/ses seviyesinden bağımsız
+        self._ref[key] = max(v, self._ref[key] * 0.97)
+        return min(1.0, v / (self._ref[key] + 1e-9))
+
+    def _decide(self, s):
+        if s["rms_avg"] < 1e-4:
+            return None                                          # sessizlik
+        loud = self._norm("rms", s["rms_avg"])
+        flux = self._norm("flux", s["onset_activity"])
+        dyn  = self._norm("dyn", s["dynamics"])
+        tempo = min(1.0, max(0.0, (s["bpm"] - 70) / 100))
+        energy = 0.4 * loud + 0.25 * flux + 0.2 * dyn + 0.15 * tempo
+        low, high = s["spectral_balance"]["low"], s["spectral_balance"]["high"]
+
+        if energy > 0.75:   cand = "storm" if low > 0.5 else "full"
+        elif energy > 0.5:  cand = "galaxy" if low > 0.5 else ("web" if high > 0.25 else "flow")
+        elif energy > 0.28: cand = "flow" if high > 0.2 else "cosmic"
+        else:               cand = "minimal"
+        # Histerezis: aynı aday üst üste iki kez gelirse sahneyi değiştir
+        if cand == self._cand or self._scene is None:
+            self._scene = cand
+        self._cand = cand
+
+        # Palet: bas ağırlığı sıcak (kırmızı/mor), tiz ağırlığı soğuk (camgöbeği/mavi)
+        target_hue = (0.92 + 0.6 * (high - low * 0.5)) % 1.0
+        dh = ((target_hue - self._hue + 0.5) % 1.0) - 0.5
+        self._hue = (self._hue + dh * 0.3 + random.uniform(-0.03, 0.03)) % 1.0
+        sat = 0.45 + 0.55 * energy
+        val = 0.75 + 0.25 * energy
+        spread = 0.08 + 0.25 * energy                            # enerjik → daha zıt renkler
+        import colorsys
+        pal = []
+        for i in range(4):
+            r, g, b = colorsys.hsv_to_rgb((self._hue + i * spread) % 1.0,
+                                          min(1.0, sat + random.uniform(-0.05, 0.05)), val)
+            pal.append({"r": r, "g": g, "b": b})
+        br, bgc, bb = colorsys.hsv_to_rgb(self._hue, 0.8, 0.02 + 0.04 * (1 - energy))
+
+        if energy > 0.75:   mood = "aggressive" if low > 0.5 else "energetic"
+        elif energy > 0.5:  mood = "energetic"
+        elif energy > 0.28: mood = "dreamy" if high > 0.2 else "ethereal"
+        else:               mood = "dark" if low > 0.5 else "calm"
+
+        return {
+            "scene": self._scene,
+            "complexity": round(0.2 + 0.8 * (0.6 * energy + 0.4 * flux), 2),
+            "speed": round(0.6 + 1.3 * (0.5 * energy + 0.5 * tempo), 2),
+            "palette": pal,
+            "bg_r": br, "bg_g": bgc, "bg_b": bb,
+            "mood": mood,
+            "shape_rain": bool(energy > 0.88 and dyn > 0.7),
+            "_type": "full",
+        }
+
     def _loop(self):
-        while self.running and not self.model:
-            try: self.model = _get_model(LM_BASE_URL)
-            except Exception as e:
-                print(f"[AI] {e} — 5sn")
-                time.sleep(5)
         while self.running:
             try:
-                snap = self.audio.snapshot()
-                body = json.dumps({
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": AI_PROMPT},
-                        {"role": "user",   "content": f"Audio:{json.dumps(snap)}"},
-                    ],
-                    "max_tokens": 800,
-                    "temperature": 0.85,
-                    "stream": False,
-                    "thinking": {"type": "disabled"},
-                }).encode()
-                req = urllib.request.Request(
-                    f"{LM_BASE_URL}/chat/completions", data=body,
-                    headers={"Content-Type":"application/json","Authorization":"Bearer lm-studio"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=20) as r:
-                    raw = json.loads(r.read())["choices"][0]["message"]["content"].strip()
-                d = _parse_json(raw)
-                if d and ("palette" in d or "mood" in d):
-                    d["_type"] = "palette"
-                    if "mandala_speed" in d: d["_type"] = "full"
+                d = self._decide(self.audio.snapshot())
+                if d:
                     if self.queue.full():
                         try: self.queue.get_nowait()
-                        except: pass
+                        except queue.Empty: pass
                     self.queue.put(d)
-                    print(f"[AI] mood:{d.get('mood','?')} mandala:{d.get('mandala_speed','—')}")
-                else:
-                    print(f"[AI] fail ({len(raw)} chars): {repr(raw[:200])}")
             except Exception as e:
-                print(f"[AI] {e}")
-            time.sleep(1.5)
-
-    def stop(self): self.running = False
+                print(f"[Director] {e}")
+            time.sleep(self.INTERVAL)
 
 
 
@@ -1458,7 +1420,7 @@ class VisualizerWindow(pyglet.window.Window):
 
         self.audio       = AudioAnalyzer()
         self.dir_queue   = queue.Queue(maxsize=8)
-        self.ai = AIDirector(self.audio, self.dir_queue)
+        self.ai = LocalDirector(self.audio, self.dir_queue)
         self.palette     = Palette()
         # Compose parametreleri (defaults)
         self.mandala_speed  = 1.0
@@ -1471,6 +1433,46 @@ class VisualizerWindow(pyglet.window.Window):
 
         self.batch  = pyglet.graphics.Batch()
         self.batch2 = pyglet.graphics.Batch()  # HUD
+
+        # Neural arka plan (CPPN + üretken shader). Başarısız olursa eski moda düşer.
+        try:
+            self.neural = NeuralBackground(self)
+        except Exception as e:
+            print(f"[Neural] Başlatılamadı, preset moda dönülüyor: {e}")
+            self.neural = None
+        self.neural_on    = self.neural is not None
+        self.show_presets = self.neural is None   # neural açıkken presetler varsayılan kapalı
+
+        # Difüzyon katmanı (rüya modu → nesneli sahneler). torch/CUDA yoksa kapalı.
+        self.diff = None
+        self.diff_on = False
+        self._diff_tex = None
+        self._diff_seen = -1
+        if self.neural is not None and diffusion_layer.available():
+            self.diff = diffusion_layer.DiffusionLayer(tap=None)
+            self.diff.start()
+            self.diff_on = True
+            print("[Difüzyon] Arka planda yükleniyor...")
+        else:
+            print("[Difüzyon] Kapalı (torch + diffusers + CUDA gerekli — venv ile çalıştır)")
+
+        # Ses modeli (spektrogram → latent) + canlı özellik kaydı
+        self.tap = AudioTap()
+        self.audio.tap = self.tap
+        self.tap.start()
+        self.audio_model = None
+        if os.path.exists(MODEL_PATH):
+            try:
+                self.audio_model = AudioLatentModel(self.tap)
+                self.audio_model.start()
+                print(f"[Model] Yüklendi: {MODEL_PATH}")
+            except Exception as e:
+                print(f"[Model] Yüklenemedi: {e}")
+        else:
+            print("[Model] models/audio_latent.onnx yok — bant tabanlı latent kullanılıyor")
+        self.use_model = self.audio_model is not None
+        if self.diff is not None:
+            self.diff.tap = self.tap          # CLAP kavram seçimi için ham ses
 
         # Fade overlay
         self.fade = shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H,
@@ -1580,10 +1582,17 @@ class VisualizerWindow(pyglet.window.Window):
                      "+/-    Hassasiyet\n"
                      "F      Tam ekran\n"
                      "SPACE  Renk paletini karistir\n"
+                     "G      Neural arka plan ac/kapa\n"
+                     "B      Preset katmanlari ac/kapa\n"
+                     "V      Yeni neural stil\n"
+                     "K      Bu stili favorilere kaydet\n"
+                     "L      Stili kilitle/coz\n"
+                     "X      Ses modelini ac/kapa\n"
+                     "C      Canli ozellik kaydi (egitim)\n"
                      "TAB    HUD goster/gizle\n"
                      "H      Bu menu\n"
                      "ESC/Q  Cikis")
-        self.help_bg = shapes.Rectangle(0, 0, 420, 300,
+        self.help_bg = shapes.Rectangle(0, 0, 420, 450,
                                         color=(10, 12, 22, 230), batch=self.help_batch)
         self.help_lbl = pyglet.text.Label(help_text, x=0, y=0,
                                           font_name="Consolas", font_size=13,
@@ -1610,7 +1619,7 @@ class VisualizerWindow(pyglet.window.Window):
             while True:
                 d = self.dir_queue.get_nowait()
                 self.palette.set(d)
-                self.mood_lbl.text = f"AI: {d.get('mood','?')}"
+                self.mood_lbl.text = f"Mood: {d.get('mood','?')}"
                 # AI sahne seçtiyse uygula (otomatik rotasyonu devralır)
                 scene = d.get("scene")
                 if scene and scene in self.ai_scene_map:
@@ -1620,7 +1629,7 @@ class VisualizerWindow(pyglet.window.Window):
                     for key in self.layers_on:
                         self.layers_on[key] = (key in layers)
                     self._cur_scene_name = scene
-                    mode = "AI"
+                    mode = "AUTO"
                     self.scene_lbl.text = f"Sahne: {scene} [{mode}]"
                 # Karmaşıklık & hız hedefleri
                 self._tgt_complexity = float(d.get("complexity", 0.6))
@@ -1697,6 +1706,34 @@ class VisualizerWindow(pyglet.window.Window):
         self.flash.color = (fc[0], fc[1], fc[2],
                             clamp8(self._flash_intensity * 60))
 
+        # Neural arka plan: bantlar → latent, palet → renk gradyanı
+        if self.neural_on:
+            self.neural.master = 0.7 if self.show_presets else 1.0
+            if self.use_model and self.audio_model.ready:
+                # Rüya modu: görüntü tamamen modelin o anki ham çıktısından türetilir
+                z, e = self.audio_model.raw()
+                self.neural.set_external_latent(z, mix=1.0)
+                self.neural.set_dream(e)
+            else:
+                self.neural.set_external_latent(None)
+                self.neural.set_dream(None)
+            self.neural.update(dt, bands, rms_s, self._flash_intensity,
+                               palette=self.palette._draw, bg=self.palette.bg)
+            n = self.neural
+            if self.diff_on and self.diff.ready and n.dreaming and hasattr(n.dream, "va"):
+                self.diff.submit(n.cur, n.latent, n.dream.va)
+            if n.dreaming and hasattr(n.dream, "mood"):
+                v, a = n.dream.va
+                txt = f"RÜYA · {n.dream.mood()}  (pozitiflik {v:+.2f}  enerji {a:+.2f})"
+                if self.diff_on and self.diff is not None and self.diff.concepts:
+                    txt += f"  · {self.diff.mood_name} · " + ", ".join(c for c, _ in self.diff.concepts)
+                self.scene_lbl.text = txt
+            elif n.dreaming:
+                self.scene_lbl.text = "Neural RÜYA — model ne duyuyorsa o  [X: kapat]"
+            else:
+                tag = " [KILIT]" if n.locked else ""
+                self.scene_lbl.text = f"Neural #{n.cur['seed']}{tag}  fav:{len(n.favorites)}"
+
         # ── Katman opaklıkları: yumuşak fade + organik nefes ───────
         for k in self.layers_on:
             tgt = 1.0 if self.layers_on[k] else 0.0
@@ -1745,24 +1782,47 @@ class VisualizerWindow(pyglet.window.Window):
             self._fps_dt = 0.0; self._fps_fr = 0
         snap = self.audio.snapshot()
         mode_txt = ["fare:kapali", "fare:cek", "fare:it"][self.mouse_mode]
+        extra = ""
+        if self.audio_model is not None:
+            extra += (f"  MODEL:{self.audio_model.infer_ms:.0f}ms" if self.use_model
+                      else "  MODEL:kapali")
+        if self.diff is not None:
+            if not self.diff_on:
+                extra += "  DIF:kapali"
+            elif self.diff.failed:
+                extra += "  DIF:hata"
+            elif not self.diff.ready:
+                extra += "  DIF:yukleniyor"
+            else:
+                extra += f"  DIF:{self.diff.fps:.0f}fps gurultu:{self.diff.noise}"
+        if self.tap.recorder is not None:
+            extra += f"  ●REC({self.tap.recorder.saved_tracks})"
         self.fps_lbl.text = (f"FPS:{self._fps_v:.0f}  RMS:{rms:.3f}  "
-                             f"BPM:{snap['bpm']:.0f}  x{self.sensitivity:.1f}  {mode_txt}")
+                             f"BPM:{snap['bpm']:.0f}  x{self.sensitivity:.1f}  {mode_txt}{extra}")
         self.fps_lbl.y = self.height - 24
 
     def on_draw(self):
         gl = pyglet.gl
         self.clear()
 
-        # 1) Fade overlay — normal blend (trail efekti)
-        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-        self.fade.width  = self.width
-        self.fade.height = self.height
-        self.fade.draw()
+        if self.neural_on and self._draw_diffusion():
+            pass                          # 1) Difüzyon sahnesi (CPPN'den hayal edilen)
+        elif self.neural_on:
+            # 1) Neural arka plan (kendi feedback izlerini kendisi yönetir)
+            self.neural.draw()
+        else:
+            # 1) Fade overlay — normal blend (trail efekti)
+            gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+            self.fade.width  = self.width
+            self.fade.height = self.height
+            self.fade.draw()
 
         # 2) Tüm görsel katmanlar — ADDITIVE blend + zoom pulse
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE)
         z = self._zoom
-        if abs(z - 1.0) > 0.001:
+        if not self.show_presets:
+            pass
+        elif abs(z - 1.0) > 0.001:
             from pyglet.math import Mat4, Vec3
             cx, cy = self.width / 2, self.height / 2
             # Merkez etrafında ölçekle: T(c) · S(z) · T(-c)
@@ -1788,9 +1848,9 @@ class VisualizerWindow(pyglet.window.Window):
         # 5) Yardım menüsü
         if self.show_help:
             self.help_bg.x  = self.width // 2 - 210
-            self.help_bg.y  = self.height // 2 - 160
+            self.help_bg.y  = self.height // 2 - 225
             self.help_lbl.x = self.width // 2 - 190
-            self.help_lbl.y = self.height // 2 + 130
+            self.help_lbl.y = self.height // 2 + 205
             self.help_batch.draw()
 
     def on_resize(self, w, h):
@@ -1844,6 +1904,49 @@ class VisualizerWindow(pyglet.window.Window):
             self._apply_scene(self.scene_idx)
         elif sym == key.R:
             self.layer_rain.burst(28)  # manuel şekil yağmuru
+        elif sym == key.G and self.neural:
+            self.neural_on = not self.neural_on
+            if not self.neural_on:
+                self.show_presets = True
+                self._apply_scene(self.scene_idx)
+        elif sym == key.B:
+            self.show_presets = not self.show_presets
+        elif sym == key.V and self.neural_on:
+            self.neural.new_style()
+        elif sym == key.K and self.neural_on:
+            self.neural.save_current()
+        elif sym == key.L and self.neural_on:
+            self.neural.locked = not self.neural.locked
+        elif sym == key.X and self.audio_model is not None:
+            self.use_model = not self.use_model
+        elif sym == key.C:
+            self.tap.toggle_recording()
+        elif sym == key.D and self.diff is not None:
+            self.diff_on = not self.diff_on
+        elif sym == key.BRACKETLEFT and self.diff is not None:
+            self.diff.noise = max(300, self.diff.noise - 50)
+        elif sym == key.BRACKETRIGHT and self.diff is not None:
+            self.diff.noise = min(950, self.diff.noise + 50)
+
+    def _draw_diffusion(self):
+        """Son difüzyon karesini ekranı kaplayacak şekilde çizer. Kare yoksa False."""
+        n = self.neural
+        if not (self.diff_on and self.diff is not None and self.diff.ready and n.dreaming):
+            return False
+        fid, frame = self.diff.get_frame()
+        if frame is None:
+            return False
+        if fid != self._diff_seen:
+            h, w = frame.shape[:2]
+            img = pyglet.image.ImageData(w, h, "RGB", frame.tobytes(), pitch=-w * 3)
+            self._diff_tex = img.get_texture()
+            self._diff_seen = fid
+        tex = self._diff_tex
+        sc = max(self.width / tex.width, self.height / tex.height)      # ekranı kapla (kenarlar kırpılır)
+        dw, dh = tex.width * sc, tex.height * sc
+        pyglet.gl.glBlendFunc(pyglet.gl.GL_ONE, pyglet.gl.GL_ZERO)
+        tex.blit((self.width - dw) / 2, (self.height - dh) / 2, width=dw, height=dh)
+        return True
 
     def _clear_layer(self, layer):
         """Sönen katmanın tüm şekillerini görünmez yap (kalıntı kalmasın)."""
@@ -1884,6 +1987,8 @@ class VisualizerWindow(pyglet.window.Window):
         """Müzik patladığında özel an: şekil yağmuru + güçlü flash + palet."""
         self.layer_rain.burst(n=int(18 + energy * 20))
         self._flash_intensity = min(1.2, self._flash_intensity + 0.9)
+        if self.neural_on:
+            self.neural.on_drop()   # drop anında hızlı stil geçişi
         # Birden fazla şok dalgası
         if "shock" in self.layers_on:
             cx, cy = self.width//2, self.height//2
@@ -1897,6 +2002,11 @@ class VisualizerWindow(pyglet.window.Window):
         print("[App] Kapatiliyor...")
         self.ai.stop()
         self.audio.stop()
+        self.tap.stop()          # açık kayıt varsa son parçayı kaydeder
+        if self.audio_model is not None:
+            self.audio_model.stop()
+        if self.diff is not None:
+            self.diff.stop()
         pyglet.app.exit()
 
 

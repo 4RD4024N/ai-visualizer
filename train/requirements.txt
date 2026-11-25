@@ -1,0 +1,9 @@
+# Eğitim ortamı (D:\ai-visualizer-work\venv)
+# pip install torch --index-url https://download.pytorch.org/whl/cu126
+# pip install -r train/requirements.txt
+numpy
+scipy
+soundfile
+onnx
+onnxruntime
+tqdm
