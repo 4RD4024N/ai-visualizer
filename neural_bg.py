@@ -522,6 +522,7 @@ class NeuralBackground:
         # Rüya modu
         self.dreaming = False
         self._dream_target = None
+        self._dream_cache = None      # (hedef, latent, stil) — aynı girdide MLP tekrar koşmaz
         self.dream = None
         try:
             self.dream = EmotionMapper()
@@ -643,8 +644,17 @@ class NeuralBackground:
 
         # Stil zamanlayıcı + morph
         if dreaming:
-            # Yumuşatma yok: modelin son çıktısı doğrudan ağ olur
-            self.cur = self.dream.style(self._dream_target, self._external)
+            # Yumuşatma yok: modelin son çıktısı doğrudan ağ olur.
+            # Ses modeli ~kare hızından seyrek güncellenir: girdi aynıysa MLP'yi tekrar koşma
+            # (deterministik → aynı çıktı; 60 FPS döngüde gereksiz numpy / dict üretimi olmasın)
+            dc = self._dream_cache
+            ext = self._external
+            if not (dc is not None and np.array_equal(dc[0], self._dream_target)
+                    and ((ext is None and dc[1] is None)
+                         or (ext is not None and dc[1] is not None and np.array_equal(dc[1], ext)))):
+                st = self.dream.style(self._dream_target, ext)
+                self._dream_cache = (self._dream_target.copy(), None if ext is None else ext.copy(), st)
+            self.cur = self._dream_cache[2]
             self.palette = self.cur["palette"]
             c0 = self.palette[0]
             self.bg = (c0[0] * 0.03, c0[1] * 0.03, c0[2] * 0.03)
