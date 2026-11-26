@@ -16,6 +16,13 @@ import math
 import os
 import queue
 import random
+import sys
+
+# Konsol yokken (dosyaya yönlendirme, paketli exe) Windows cp1252 kullanır;
+# "→" gibi karakterler print'te hata verip difüzyon/duygu yüklemesini kırar.
+for _s in (sys.stdout, sys.stderr):
+    if _s is not None and hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
 
 import numpy as np
 import pyglet
