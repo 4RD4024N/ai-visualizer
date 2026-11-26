@@ -204,20 +204,20 @@ A small CNN (~1.2M parameters) maps a 2-second log-mel spectrogram (16 kHz, 64 m
 Feature extraction ([audio_features.py](audio_features.py)) is shared between training and runtime, so the features always match. At runtime the model runs at 10 Hz on CPU via ONNX Runtime.
 
 ```
-# Training environment (kept outside the repo, e.g. D:\ai-visualizer-work)
-python -m venv D:\ai-visualizer-work\venv
-D:\ai-visualizer-work\venv\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cu126
-D:\ai-visualizer-work\venv\Scripts\pip install -r train/requirements.txt
+# Training environment: work/ (data, features, HF cache, checkpoints) and .venv/ live in the repo but are gitignored
+python -m venv .venv
+.venv\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cu126
+.venv\Scripts\pip install -r train/requirements.txt
 
 # 1) Features from a dataset (FMA-small: 8000 CC-licensed 30 s tracks), read straight from the zip
-python train/prepare.py --zip D:\ai-visualizer-work\data\fma_small.zip --out D:\ai-visualizer-work\features\fma
+python train/prepare.py --zip work\data\fma_small.zip --out work\features\fma
 
 # 2) Optional: press C in the visualizer while listening to music.
 #    Only log-mel features are stored, never audio. Tracks are split on silence.
 
 # 3) Train → models/audio_latent.onnx
 python train/train.py --steps 8000
-python train/emb_stats.py --data D:\ai-visualizer-work\features\fma
+python train/emb_stats.py --data work\features\fma
 ```
 
 `emb_stats.py` saves whitening statistics for the model's 128-dim embedding (`models/audio_latent_emb.npz`), which dream mode needs.
@@ -227,7 +227,7 @@ python train/emb_stats.py --data D:\ai-visualizer-work\features\fma
 Dream mode turns the music's emotion into visuals with two more learned parts:
 
 ```
-python train/prepare.py --zip D:\ai-visualizer-work\data\deam\DEAM_audio.zip --out D:\ai-visualizer-work\features\deam
+python train/prepare.py --zip work\data\deam\DEAM_audio.zip --out work\features\deam
 python train/emotion.py      # emotion head: embedding -> valence/arousal (DEAM human annotations)
 python train/visual.py       # visual generator: (valence, arousal, music latent) -> CPPN world, guided by CLIP
 ```
@@ -270,7 +270,7 @@ Each scene's prompt is built from what the music is doing right now:
 - **Variety:** a new scene drops the previous image from memory, starts at high noise with a new seed and framing, and avoids recently used concepts.
 - **Speed:** SD runs on a high-priority CUDA stream with CLAP and Whisper on low-priority streams in their own threads (SD frame time with Whisper running: 115 → 83 ms; ~50 ms alone on an RTX 4070 Ti SUPER). `diff_fast` adds channels_last, cudnn.benchmark and inference_mode, and a short warm-up at load; `diff_compile` optionally wraps the UNet in `torch.compile` (off by default; needs Triton on Windows). Each falls back to the old path with a log line if it fails.
 
-The work directory can be changed with the `AIVIS_WORK` environment variable.
+The work directory defaults to `work/` next to the app (gitignored) and can be changed with the `AIVIS_WORK` environment variable.
 
 ## Development
 
@@ -282,8 +282,8 @@ python -m pytest tests
 The lyric → image path is tested without a GPU ([tests/test_latency.py](tests/test_latency.py)): fake Whisper and SD objects check window timing, translate-first ordering, retraction, lyric priority, first-frame tagging and the latency breakdown. On the GPU machine, measure the real end-to-end latency with:
 
 ```
-D:/ai-visualizer-work/venv/Scripts/python.exe tools/bench_latency.py --wav song_with_vocals.wav
-D:/ai-visualizer-work/venv/Scripts/python.exe tools/bench_latency.py --wav song_with_vocals.wav --legacy
+.venv/Scripts/python.exe tools/bench_latency.py --wav song_with_vocals.wav
+.venv/Scripts/python.exe tools/bench_latency.py --wav song_with_vocals.wav --legacy
 ```
 
 The tests need neither audio hardware nor OpenGL: beat tracking and section detection run on synthetic signals, the analyzer is fed generated tones and a kick-drum pattern, the director and config are checked directly, the ONNX model is run once, model metrics are checked against floors, and the recorder produces a real MP4 through ffmpeg with a fake GL source (skipped if ffmpeg is missing). GitHub Actions runs lint + tests on every push ([.github/workflows/tests.yml](.github/workflows/tests.yml)).

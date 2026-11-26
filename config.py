@@ -55,6 +55,8 @@ def app_dir():
 
 
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
+# Veri, feature, HF önbelleği, checkpoint'ler (git'e girmez). AIVIS_WORK ile değiştirilebilir.
+WORK_DIR = os.environ.get("AIVIS_WORK") or os.path.join(app_dir(), "work")
 
 
 def _coerce(value, default):

@@ -7,3 +7,9 @@ neural_styles/
 build/
 dist/
 .pytest_cache/
+
+# Yerel çalışma alanı: veri, feature, HF önbelleği, checkpoint (AIVIS_WORK)
+work/
+# Sanal ortam
+.venv/
+venv/

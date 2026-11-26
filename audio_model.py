@@ -18,7 +18,7 @@ import numpy as np
 from audio_features import SR, HOP, N_MELS, FRAMES, WINDOW_SAMPLES, logmel, StreamResampler
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-WORK_DIR = os.environ.get("AIVIS_WORK", r"D:\ai-visualizer-work")
+from config import WORK_DIR  # noqa: E402
 LIVE_DIR = os.path.join(WORK_DIR, "features", "live")
 MODEL_PATH = os.path.join(ROOT, "models", "audio_latent.onnx")
 

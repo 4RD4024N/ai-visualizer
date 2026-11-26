@@ -1,8 +1,8 @@
 """
 Söz → ilk kare gecikme ölçümü (gerçek modellerle; kullanıcının makinesinde, venv ile).
 
-  D:/ai-visualizer-work/venv/Scripts/python.exe tools/bench_latency.py --wav sarki.wav
-  D:/ai-visualizer-work/venv/Scripts/python.exe tools/bench_latency.py --wav sarki.wav --legacy
+  .venv/Scripts/python.exe tools/bench_latency.py --wav sarki.wav
+  .venv/Scripts/python.exe tools/bench_latency.py --wav sarki.wav --legacy
 
 SD-Turbo + TAESD + CLAP (diffusion_layer.DiffusionLayer) ve Whisper (lyrics.LyricsListener)
 uygulamadaki gibi yüklenir; --wav dosyası gerçek zamanlı akıyormuş gibi (saatle) beslenir.

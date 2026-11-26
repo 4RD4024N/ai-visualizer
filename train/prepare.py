@@ -6,8 +6,8 @@ Ses dosyalarını log-mel özelliklere çevirir (ses kaydedilmez, sadece özelli
   index.json  {"n_mels": 64, "frames": toplam, "tracks": [{"name", "start", "length"}, ...]}
 
 Kullanım:
-  python train/prepare.py --zip D:/ai-visualizer-work/data/fma_small.zip --out D:/ai-visualizer-work/features/fma
-  python train/prepare.py --dir D:/muziklerim --out D:/ai-visualizer-work/features/benim
+  python train/prepare.py --zip work/data/fma_small.zip --out work/features/fma
+  python train/prepare.py --dir D:/muziklerim --out work/features/benim
 """
 
 import argparse

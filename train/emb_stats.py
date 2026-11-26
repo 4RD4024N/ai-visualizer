@@ -6,7 +6,7 @@ Rüya modu (neural_bg.DreamMapper) embedding'i doğrudan CPPN ağırlıklarına
 önce PCA ile beyazlatılır: her bileşen ≈ ortalama 0, varyans 1, ilişkisiz.
 
 Kullanım (train.py'den sonra):
-  python train/emb_stats.py --data D:/ai-visualizer-work/features/fma
+  python train/emb_stats.py --data work/features/fma
 Çıktı: models/audio_latent_emb.npz  (mu[128], white[128,128])
 """
 

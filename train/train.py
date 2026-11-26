@@ -16,7 +16,7 @@ Benzer müzik → benzer görsel dünya, farklı müzik → farklı dünya.
 
 Kullanım:
   python train/train.py                       # WORK/features altındaki tüm veri setleri
-  python train/train.py --steps 12000 --data D:/ai-visualizer-work/features/fma
+  python train/train.py --steps 12000 --data work/features/fma
 """
 
 import argparse
@@ -36,7 +36,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from audio_features import SR, N_FFT, HOP, N_MELS, FRAMES, FMIN, FMAX  # noqa: E402
 
-WORK = os.environ.get("AIVIS_WORK", r"D:\ai-visualizer-work")
+WORK = os.environ.get("AIVIS_WORK") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "work")
 LATENT = 8
 EMB = 128
 

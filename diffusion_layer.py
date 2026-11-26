@@ -42,7 +42,10 @@ import time
 import numpy as np
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-WORK = os.environ.get("AIVIS_WORK", r"D:\ai-visualizer-work")
+from config import WORK_DIR as WORK  # noqa: E402
+# Modeller her zaman projenin kendi önbelleğinde (sistemdeki HF_HOME başka bir projeyi gösterebilir).
+# torch / transformers / diffusers import edilmeden önce ayarlanmalı.
+os.environ["HF_HOME"] = os.path.join(WORK, "hf")
 
 # CLAP metin uzayında duygu eksenleri: kavram / ruh hali / müzik bu eksenlere izdüşürülür
 AXIS_TEXT = {
@@ -210,7 +213,6 @@ class DiffusionLayer:
 
     # ── Difüzyon thread'i ──
     def _load(self):
-        os.environ.setdefault("HF_HOME", os.path.join(WORK, "hf"))
         import torch
         from diffusers import AutoPipelineForImage2Image, AutoencoderTiny
         sys.path.insert(0, os.path.join(ROOT, "train"))

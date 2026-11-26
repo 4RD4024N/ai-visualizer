@@ -35,7 +35,9 @@ import numpy as np
 
 import latency
 
-WORK = os.environ.get("AIVIS_WORK", r"D:\ai-visualizer-work")
+from config import WORK_DIR as WORK  # noqa: E402
+# Modeller her zaman projenin kendi önbelleğinde (sistemdeki HF_HOME başka bir projeyi gösterebilir).
+os.environ["HF_HOME"] = os.path.join(WORK, "hf")
 MODEL = "openai/whisper-medium"
 
 BLACKLIST = [
@@ -147,7 +149,6 @@ class LyricsListener:
 
     # ── Thread ──
     def _load(self):
-        os.environ.setdefault("HF_HOME", os.path.join(WORK, "hf"))
         import torch
         from transformers import WhisperForConditionalGeneration, WhisperProcessor
         from transformers.utils import logging as hf_logging

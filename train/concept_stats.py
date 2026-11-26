@@ -15,8 +15,9 @@ import subprocess
 import sys
 import zipfile
 
-WORK = os.environ.get("AIVIS_WORK", r"D:\ai-visualizer-work")
-os.environ.setdefault("HF_HOME", os.path.join(WORK, "hf"))
+WORK = os.environ.get("AIVIS_WORK") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "work")
+os.environ["HF_HOME"] = os.path.join(WORK, "hf")   # sistem HF_HOME'u başka projeyi gösterebilir
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 

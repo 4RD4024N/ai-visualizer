@@ -10,7 +10,7 @@ Ses modeli DONUK kalır (embedding değişmez → rüya modu / emb_stats bozulma
 sadece küçük bir MLP eğitilir. Doğrulama şarkıları eğitimde hiç görülmez.
 
 Kullanım:
-  python train/prepare.py --zip D:/ai-visualizer-work/data/deam/DEAM_audio.zip --out D:/ai-visualizer-work/features/deam
+  python train/prepare.py --zip work/data/deam/DEAM_audio.zip --out work/features/deam
   python train/emotion.py
 Çıktı: models/emotion_head.npz  (numpy ile çalışır, canlıda ONNX gerekmez)
 """
@@ -32,7 +32,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from audio_features import SR, HOP, N_MELS, FRAMES  # noqa: E402
 import train as T  # noqa: E402
 
-WORK = os.environ.get("AIVIS_WORK", r"D:\ai-visualizer-work")
+WORK = os.environ.get("AIVIS_WORK") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "work")
 DYN = "annotations/annotations averaged per song/dynamic (per second annotations)/{}.csv"
 SHIFTS = (0, 8, 16, 24)          # canlıdaki çoklu hizalama ile aynı aralık (0–384 ms geri)
 
