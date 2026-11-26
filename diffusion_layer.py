@@ -19,6 +19,13 @@ Zincir: ses → ses modeli → duygu başlığı → görsel üretici (CPPN) →
   • Gürültü         : sabit tohum — girdi az değişince sahne de az değişir (akıcılık)
   • Gürültü seviyesi: düşük = CPPN'e sadık, yüksek = model daha özgür hayal eder
 
+Söz önceliği : yeni söz satırı MIN_SCENE'i beklemez (LYRIC_MIN_SCENE yeter); Whisper satırı
+               yayınlayınca SD thread'i bir threading.Event ile hemen uyanır. Satırın ilk
+               karesi `frame_lyric` ile işaretlenir → ekranda kısa geçişle çizilir ve
+               gecikme ölçülür (latency.py).
+Hız          : channels_last + cudnn.benchmark + inference_mode (diff_fast), isteğe bağlı
+               torch.compile (diff_compile, varsayılan kapalı). Yüklemede ısınma kareleri.
+
 Ayrı thread'de çalışır; pencere / ses akışı beklemez. torch + diffusers yoksa
 (ör. sistem Python'u) katman sessizce devre dışı kalır.
 Modeller: stabilityai/sd-turbo (ticari olmayan lisans), madebyollin/taesd (hızlı çözücü),
@@ -26,6 +33,7 @@ Modeller: stabilityai/sd-turbo (ticari olmayan lisans), madebyollin/taesd (hızl
 """
 
 import collections
+import importlib.util
 import os
 import sys
 import threading
@@ -61,11 +69,29 @@ ANCHORS = {
 
 def available():
     try:
-        import torch  # noqa: F401
-        import diffusers  # noqa: F401
+        if importlib.util.find_spec("diffusers") is None:
+            return False
+        import torch
         return torch.cuda.is_available()
     except Exception:
         return False
+
+
+def scene_due(age, changed, want_scene, new_line, min_scene, scene_sec,
+              lyric_priority=True, lyric_min_scene=0.3):
+    """Yeni sahne kurulmalı mı? (torch'suz, birim testli)
+    changed       : müzik belirgin değişti (yaştan bağımsız)
+    want_scene    : ana thread ölçü başında istedi → en az min_scene
+    new_line      : yeni söz satırı → söz önceliği açıksa sadece lyric_min_scene
+                    (art arda iki satırda titreme olmasın diye küçük bir taban)
+    age≥scene_sec : sahne zaten uzun sürdü"""
+    if changed or age >= scene_sec:
+        return True
+    if want_scene and age >= min_scene:
+        return True
+    if new_line:
+        return age >= (lyric_min_scene if lyric_priority else min_scene)
+    return False
 
 
 class DiffusionLayer:
@@ -75,6 +101,7 @@ class DiffusionLayer:
     POOL, MOOD_POOL = 8, 3     # çekilişin yapıldığı en uyan kavram / ruh hali sayısı (dar = şarkıya sadık)
     SCENE_SEC = 3.0            # bir sahnenin en uzun süresi (beat kilidi yokken)
     MIN_SCENE = 1.2            # ölçü başı isteğinde bile en kısa sahne
+    LYRIC_MIN_SCENE = 0.3      # söz önceliği: yeni söz satırı için en kısa sahne
     CHANGE_DIST = 0.12         # müzik değişimi eşiği (CLAP temsilinde kosinüs uzaklığı)
     RECENT = 4                 # son kaç kavram tekrar seçilmez (ruh hali: son 1)
     GENRE_EMA = 0.15           # tür olasılığının yumuşatması (her ~0,4 sn) — tür sahne sahne zıplamasın
@@ -89,8 +116,17 @@ class DiffusionLayer:
                 "low angle, ", "detailed scene, "]
     MEMORY = 0.55              # başlangıç resminde önceki hayalin payı
 
-    def __init__(self, tap=None, size=(640, 384), noise=800, seed=42):
+    def __init__(self, tap=None, size=(640, 384), noise=800, seed=42, tracker=None,
+                 lyric_priority=True, fast=True, compile=False):
         self.tap = tap
+        self.tracker = tracker         # latency.LatencyTracker (ya da None)
+        self.lyric_priority = lyric_priority
+        self.fast = fast               # channels_last + cudnn.benchmark + inference_mode
+        self.compile = compile         # torch.compile (UNet) — Windows'ta triton gerekir, riskli
+        self._wake = threading.Event() # yeni söz satırı → SD thread'i beklemeden uyanır
+        self._lyric_pending = None     # sahnesi kuruldu, ilk karesi henüz üretilmedi (line_id)
+        self.frame_lyric = None        # son karenin "söz satırının ilk karesi" etiketi (line_id)
+        self._unet_eager = None
         self.concepts = []             # [(kavram, ağırlık)] — HUD için
         self.mood_name = None          # baskın ruh hali — HUD için
         self.va_eff = None             # sahnede kullanılan (valence, arousal) — model + CLAP
@@ -154,6 +190,18 @@ class DiffusionLayer:
         with self._lock:
             return self.frame_id, self.frame
 
+    def get_frame_info(self):
+        """(kare no, kare, söz satırı id | None) — id yalnızca o satırın İLK karesinde dolu."""
+        with self._lock:
+            return self.frame_id, self.frame, self.frame_lyric
+
+    def wake(self, *_):
+        """Söz dinleyicinin geri çağrısı: yeni satır geldi."""
+        self._wake.set()
+
+    def _nograd(self):
+        return self.torch.inference_mode() if self.fast else self.torch.no_grad()
+
     # ── Difüzyon thread'i ──
     def _load(self):
         os.environ.setdefault("HF_HOME", os.path.join(WORK, "hf"))
@@ -169,10 +217,56 @@ class DiffusionLayer:
         pipe = pipe.to(self.dev)
         pipe.set_progress_bar_config(disable=True)
         self.pipe = pipe
+        self._speedups()
         with torch.no_grad():
             self.anc = {q: pipe.encode_prompt(t, self.dev, 1, False)[0].mean(0, keepdim=True)
                         for q, t in ANCHORS.items()}
         self._load_clap()
+        self._warmup()
+
+    def _speedups(self):
+        """Kaliteyi değiştirmeyen hızlandırmalar. Her biri ayrı ayrı denenir; hata → eski yol + log."""
+        torch, pipe = self.torch, self.pipe
+        if self.fast:
+            try:
+                torch.backends.cudnn.benchmark = True          # sabit boyut (640×384): en hızlı conv algoritması
+                pipe.unet.to(memory_format=torch.channels_last)
+                pipe.vae.to(memory_format=torch.channels_last)
+                print("[Difüzyon] Hızlandırma: channels_last + cudnn.benchmark + inference_mode")
+            except Exception as e:
+                self.fast = False
+                print(f"[Difüzyon] Hızlandırma kapalı ({e})")
+        if self.compile:
+            try:
+                self._unet_eager = pipe.unet
+                pipe.unet = torch.compile(pipe.unet, mode="max-autotune-no-cudagraphs", dynamic=False)
+                print("[Difüzyon] torch.compile açık (ilk kareler derleme yüzünden yavaş)")
+            except Exception as e:
+                self._uncompile(e)
+
+    def _uncompile(self, err):
+        if self._unet_eager is not None:
+            self.pipe.unet = self._unet_eager
+            self._unet_eager = None
+        self.compile = False
+        print(f"[Difüzyon] torch.compile kapatıldı, eski yola dönüldü ({err})")
+
+    def _warmup(self, n=2):
+        """İlk gerçek kare (çoğu zaman bir söz sahnesi) cudnn / derleme ısınmasını beklemesin."""
+        torch = self.torch
+        try:
+            init = torch.full((1, 3, self.h, self.w), 0.5, device=self.dev)
+            pe = next(iter(self.anc.values()))
+            for _ in range(n):
+                with self._nograd():
+                    self.pipe(prompt_embeds=pe, image=init, strength=1.0, timesteps=[self.FRESH_NOISE],
+                              guidance_scale=0.0, output_type="pt")
+            torch.cuda.synchronize()
+        except Exception as e:
+            if self.compile:
+                self._uncompile(e)
+            else:
+                print(f"[Difüzyon] Isınma atlandı ({e})")
 
     def _load_clap(self):
         """CLAP + kavram istatistikleri. Yoksa sadece duygu kullanılır."""
@@ -286,10 +380,15 @@ class DiffusionLayer:
         now = time.time()
         age = now - self._scene_t
         changed = self._scene_a is None or float(1 - (a @ self._scene_a)) > self.CHANGE_DIST
-        lyric = self.lyrics.current() if (self.lyrics is not None and self.lyrics.enabled) else None
-        new_line = lyric is not None and self.lyrics.line_id != self._lyric_seen
-        wanted = (self._want_scene or new_line) and age >= self.MIN_SCENE
-        if not (changed or wanted or age >= self.SCENE_SEC):
+        lyric, lid = None, None
+        if self.lyrics is not None and self.lyrics.enabled:
+            if hasattr(self.lyrics, "current_with_id"):
+                lyric, lid = self.lyrics.current_with_id()
+            else:
+                lyric, lid = self.lyrics.current(), self.lyrics.line_id
+        new_line = lyric is not None and lid != self._lyric_seen
+        if not scene_due(age, changed, self._want_scene, new_line, self.MIN_SCENE, self.SCENE_SEC,
+                         self.lyric_priority, self.LYRIC_MIN_SCENE):
             return                                                       # sahne sürüyor
         self._want_scene = False
         rng = self._rng
@@ -309,9 +408,9 @@ class DiffusionLayer:
         zm_sel = zm + self.EMO_WEIGHT_M * (ev * self.m_v + ea * self.m_a)
         # Söz: satıra anlamca yakın kavramlar öne çıkar (CLAP metin uzayında benzerlik)
         if lyric is not None:
-            self._lyric_seen = self.lyrics.line_id
+            self._lyric_seen = lid
             if self._lyric_emb[0] != lyric:
-                with torch.no_grad():
+                with self._nograd():
                     li = self.clap_proc(text=[lyric], return_tensors="pt", padding=True).to(self.dev)
                     lt = self.clap.get_text_features(**li)
                     lt = torch.nn.functional.normalize(getattr(lt, "pooler_output", lt), dim=-1)[0]
@@ -347,8 +446,12 @@ class DiffusionLayer:
         if sec:
             parts.append(sec)
         prompt = framing + ", ".join(parts)
-        with torch.no_grad():
+        with self._nograd():
             self._prompt_pe = self.pipe.encode_prompt(prompt, self.dev, 1, False)[0]
+        if new_line:                                                     # gecikme ölçümü: sahne kuruldu
+            self._lyric_pending = lid
+            if self.tracker is not None:
+                self.tracker.stamp(lid, "scene")
         self._prompt = prompt
         self.seed = int(rng.integers(1 << 31))                            # yeni kompozisyon
         self._scene_t, self._scene_a = now, a
@@ -377,7 +480,7 @@ class DiffusionLayer:
     def _generate(self, st, z, va):
         """Bir kare: CPPN (+ önceki hayal) → SD-Turbo. (h, w, 3) uint8 döndürür."""
         torch = self.torch
-        with torch.no_grad():
+        with self._nograd():
             zt = torch.tensor(np.clip(z, -3, 3), device=self.dev)[None]
             st = dict(st, lines=0.0)                                    # kontur çizgileri yok
             init = self.V.render(self._style_tensors(st), zt, self.h, self.w)
@@ -430,19 +533,30 @@ class DiffusionLayer:
             with self._lock:
                 inp, iid = self._inp, self._inp_id
             if inp is None or iid == last_id:
-                time.sleep(0.005)
+                # Yeni girdi yok: kısa bekle, ama yeni söz satırı gelirse hemen uyan
+                if self._wake.wait(0.005):
+                    self._wake.clear()
                 continue
             last_id = iid
             st, z, va = inp
+            pending = self._lyric_pending
             t1 = time.perf_counter()
             try:
                 img = self._generate(st, z, va)
             except Exception as e:
+                if self.compile:                                         # derlenmiş UNet hata verdi → eski yol
+                    self._uncompile(e)
+                    continue
                 print(f"[Difüzyon] Hata: {e}")
                 time.sleep(0.5)
                 continue
+            if pending is not None and self.tracker is not None:
+                self.tracker.stamp(pending, "frame")
             with self._lock:
                 self.frame, self.frame_id = img, self.frame_id + 1
+                self.frame_lyric = pending
+            if pending is not None and self._lyric_pending == pending:
+                self._lyric_pending = None
             times.append(time.perf_counter() - t1)
             if len(times) >= 10:
                 self.fps = len(times) / sum(times)

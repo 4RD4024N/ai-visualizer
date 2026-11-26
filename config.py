@@ -30,6 +30,16 @@ DEFAULTS = {
     "diff_valence_bias": 0.0,     # difüzyon: pozitiflik eğilimi (−1 karamsar … +1 neşeli)
     "lyrics": True,               # şarkı sözlerini dinle (Whisper) ve sahneye kat
     "lyrics_model": "openai/whisper-medium",   # ya da openai/whisper-large-v3 / whisper-small
+    "lyrics_window": 4.0,         # Whisper penceresi (sn) — kısa = daha az token, daha hızlı
+    "lyrics_step": 0.5,           # pencere adımı (sn) — çıkarım daha uzunsa döngü beklemeden sürer
+    "lyrics_translate_first": True,   # Türkçe: SD'ye giden çeviri tek generate ile önce
+    "lyrics_hud_original": True,  # Türkçe orijinali (HUD) yeni satırlarda sonradan üret
+    "lyrics_reuse_encoder": True, # dil tespitinin encoder çıktısını generate'e ver (hata → eski yol)
+    "lyric_priority": True,       # yeni söz satırı MIN_SCENE'i beklemeden sahne kursun
+    "lyric_fade": 0.06,           # söz satırının ilk karesinde çapraz geçiş (sn, 0 = anında)
+    "latency_log": True,          # her söz satırı için [Gecikme] logu + HUD
+    "diff_fast": True,            # channels_last + cudnn.benchmark + inference_mode (hata → eski yol)
+    "diff_compile": False,        # torch.compile (Windows'ta triton gerekir; hata → eski yol)
     # Kayıt
     "record_fps": 30,
     "record_crf": 18,             # x264 kalite: düşük = daha iyi (18 ≈ görsel kayıpsız)
