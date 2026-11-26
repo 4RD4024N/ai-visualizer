@@ -1,5 +1,5 @@
 durum: çalışıyor
-son_güncelleme: 2026-11-26T01:07:08Z
+son_güncelleme: 2026-11-26T01:08:11Z
 pr: https://github.com/4RD4024N/ai-visualizer/pull/1
 
 # Gece ilerleme notları (perf/lyric-latency)
@@ -16,6 +16,6 @@ pr: https://github.com/4RD4024N/ai-visualizer/pull/1
 - PR #1 açıldı.
 
 ## Sıradakiler
-- tools/bench_latency.py
+- (bitti) tools/bench_latency.py
 - README güncellemesi, PR açıklaması
 - (isteğe bağlı) 60 FPS ana döngüde mikro optimizasyonlar
