@@ -299,8 +299,10 @@ class LyricsListener:
             return None
         if orig is None and self.hud_original:
             # Satır SD'ye çoktan gitti; Türkçe orijinal yalnızca HUD / log ve kara liste için
-            orig2, _ = self._original(ctx)
-            if blacklisted(orig2):
+            # Eski filtrenin gücü korunur: orijinal kara listede ya da log-olasılığı düşükse
+            # (eski yolda min(transcribe, translate) eşiği) satır geri çekilir
+            orig2, avg2 = self._original(ctx)
+            if blacklisted(orig2) or avg2 < self.MIN_LOGPROB:
                 self._retract(lid)
                 print(f"[Söz] [{lang}] geri çekildi (uydurma): {orig2}")
                 return None
