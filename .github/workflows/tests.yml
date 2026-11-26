@@ -20,6 +20,6 @@ jobs:
         # pyglet / sounddevice gerekmez: testler ses donanımı ve OpenGL olmadan çalışır
         run: pip install numpy scipy onnxruntime pytest pyflakes
       - name: Lint
-        run: python -m pyflakes beat.py structure.py audio_analyzer.py director.py palette.py config.py recorder.py settings_menu.py visualizer.py layers tools tests
+        run: python -m pyflakes beat.py structure.py audio_analyzer.py director.py palette.py config.py recorder.py settings_menu.py visualizer.py latency.py lyrics.py diffusion_layer.py layers tools tests
       - name: Testler
         run: python -m pytest -v tests

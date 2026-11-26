@@ -24,6 +24,7 @@ import pyglet.shapes as shapes
 import config
 import diffusion_layer
 import lyrics as lyrics_mod
+import latency
 from audio_analyzer import AudioAnalyzer, BANDS
 from audio_model import AudioTap, AudioLatentModel, MODEL_PATH
 from director import LocalDirector
@@ -97,8 +98,13 @@ class VisualizerWindow(pyglet.window.Window):
         self._diff_seen = -1
         self._diff_t = 0.0            # yeni karenin geldiği an
         self._diff_fade = 0.25        # geçiş süresi (difüzyon hızına göre ayarlanır)
+        # Söz → ekran gecikmesi: Whisper, SD ve çizim damgaları (latency.py)
+        self.latency = latency.LatencyTracker(enabled=self.cfg["latency_log"])
         if self.neural is not None and diffusion_layer.available():
-            self.diff = diffusion_layer.DiffusionLayer(tap=None)
+            self.diff = diffusion_layer.DiffusionLayer(tap=None, tracker=self.latency,
+                                                       lyric_priority=self.cfg["lyric_priority"],
+                                                       fast=self.cfg["diff_fast"],
+                                                       compile=self.cfg["diff_compile"])
             self.diff.valence_bias = self.cfg["diff_valence_bias"]
             self.diff.start()
             self.diff_on = True
@@ -126,8 +132,13 @@ class VisualizerWindow(pyglet.window.Window):
             self.diff.tap = self.tap          # CLAP kavram seçimi için ham ses
             # Şarkı sözü dinleyici (Whisper) — difüzyonla aynı ortamı ister
             # transformers import'u thread-safe değil: difüzyon yüklenmeden başlatılmaz (bkz. update)
-            self.lyrics = lyrics_mod.LyricsListener(self.tap, model=self.cfg["lyrics_model"])
+            self.lyrics = lyrics_mod.LyricsListener(
+                self.tap, model=self.cfg["lyrics_model"], window=self.cfg["lyrics_window"],
+                step=self.cfg["lyrics_step"], translate_first=self.cfg["lyrics_translate_first"],
+                hud_original=self.cfg["lyrics_hud_original"],
+                reuse_encoder=self.cfg["lyrics_reuse_encoder"], tracker=self.latency)
             self.lyrics.enabled = self.cfg["lyrics"]
+            self.lyrics.on_line.append(self.diff.wake)    # yeni satır → SD thread'i hemen uyanır
             self.diff.lyrics = self.lyrics
 
         # Fade overlay
@@ -502,6 +513,8 @@ class VisualizerWindow(pyglet.window.Window):
                 extra += "  DIF:yukleniyor"
             else:
                 extra += f"  DIF:{self.diff.fps:.0f}fps gurultu:{self.diff.noise}"
+                if self.latency.last is not None and self.cfg["latency_log"]:
+                    extra += f"  söz→ekran:{self.latency.last[0]:.2f}sn"
         if self.tap.recorder is not None:
             extra += f"  ●ÖZELLİK({self.tap.recorder.saved_tracks})"
         rec = self.recorder
@@ -681,7 +694,7 @@ class VisualizerWindow(pyglet.window.Window):
         n = self.neural
         if not (self.diff_on and self.diff is not None and self.diff.ready and n.dreaming):
             return False
-        fid, frame = self.diff.get_frame()
+        fid, frame, lyric_id = self.diff.get_frame_info()
         if frame is None:
             return False
         if fid != self._diff_seen:
@@ -695,6 +708,10 @@ class VisualizerWindow(pyglet.window.Window):
             self._diff_t = self.t
             # Geçiş ≈ iki kare arası süre: sürekli akış, ama yavaş üretimde de bekletmez
             self._diff_fade = min(0.5, max(0.08, 1.0 / max(self.diff.fps, 1e-3)))
+            if lyric_id is not None:
+                # Söz satırının ilk karesi: neredeyse anında (≤ lyric_fade) — gecikmeye geçiş eklenir
+                self._diff_fade = max(1e-3, self.cfg["lyric_fade"])
+                self.latency.finish(lyric_id, extra=self.cfg["lyric_fade"])
         a = min(1.0, (self.t - self._diff_t) / self._diff_fade)
         if a >= 1.0 and len(self._diff_sprites) == 2:
             self._diff_sprites[0].delete()
