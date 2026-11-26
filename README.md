@@ -139,6 +139,14 @@ Press **S** for the on-screen menu (↑↓ select, ←→ change, R reset, S clo
 | `scene_duration` | 22 | Preset scene rotation (s) |
 | `show_hud` | true | HUD visibility |
 | `record_fps`, `record_crf`, `record_dir`, `record_hud` | 30, 18, `recordings`, false | Recording options |
+| `lyrics`, `lyrics_model` | true, `openai/whisper-medium` | Listen to lyrics (Whisper) and put them into scenes |
+| `lyrics_window`, `lyrics_step` | 4.0, 0.5 | Whisper window and step (s) |
+| `lyrics_translate_first` | true | Turkish: generate the English translation first, in one pass (false = old order: transcribe + translate) |
+| `lyrics_hud_original` | true | Turkish: generate the original text for the HUD afterwards, for new lines only |
+| `lyrics_reuse_encoder` | true | Reuse the language-detection encoder output in `generate` |
+| `lyric_priority`, `lyric_fade` | true, 0.06 | A new lyric line starts a scene without waiting for the minimum scene length; crossfade (s) of its first frame |
+| `latency_log` | true | `[Gecikme]` log line per lyric line + HUD value |
+| `diff_fast`, `diff_compile` | true, false | Diffusion speedups (channels_last + cudnn.benchmark + inference_mode) / `torch.compile` |
 
 ## Controls
 
@@ -256,10 +264,11 @@ Each scene's prompt is built from what the music is doing right now:
 
 - **Genre:** CLAP zero-shot classification over 33 genres (rock, techno, phonk, synthwave, Turkish pop, Anatolian rock, arabesque, ...), smoothed over time, picks the visual style.
 - **Emotion:** valence/arousal from the emotion head averaged with CLAP's own reading (the correlation between the music's mood profile and each mood's position on CLAP-text valence/arousal axes). Emotion-matching concepts and moods are favored and an emotion phrase is added. *Diffusion: pozitiflik eğilimi* in the settings menu shifts valence if a song reads darker than it feels.
-- **Lyrics:** [lyrics.py](lyrics.py) runs Whisper (`openai/whisper-medium` by default, `lyrics_model` in `config.json`) on the last 6 s every 1.5 s, choosing only between Turkish and English. Turkish lines are also translated to English for the SD text encoder. A new line starts a new scene, goes first in the prompt and boosts concepts close to it in meaning. Hallucinations under music ("thank you for watching", "altyazı M.K.") are filtered by log-probability, a blacklist and repetition checks.
+- **Lyrics:** [lyrics.py](lyrics.py) runs Whisper (`openai/whisper-medium` by default, `lyrics_model` in `config.json`) on a sliding window (last 4 s, every 0.5 s; if inference takes longer the next window starts immediately), choosing only between Turkish and English. For Turkish, the English translation that SD needs is generated first in a single pass and published right away; the Turkish original (HUD/log) is generated afterwards, only for new lines. The encoder output from language detection is reused by `generate`. A new line starts a new scene immediately (it does not wait for the 1.2 s minimum scene length), wakes the SD thread, goes first in the prompt and boosts concepts close to it in meaning; its first frame is shown with a ≤ 60 ms crossfade. Hallucinations under music ("thank you for watching", "altyazı M.K.") are filtered by log-probability, a blacklist (also on the Turkish original, which can retract a line) and repetition checks.
+- **Lyric latency:** every accepted line is timed from the audio window to the first frame on screen ([latency.py](latency.py)) and logged as `[Gecikme] söz→ekran 1.12 sn (bekleme 0.25, whisper 0.62, sahne 0.03, kare 0.08, çizim 0.08)`; the HUD shows the last value. The exact moment a word was sung is unknown, so "heard" is approximated as the middle of the audio that entered the window since the previous one (±step/2). `tools/bench_latency.py --wav song.wav` measures the same thing with the real models on a file streamed in real time (`--legacy` for the old settings).
 - **Structure and beat:** a new scene on every bar (or every N bars) and on every section change; the section adds a phrase (drop → "explosive climax", breakdown → "sparse, quiet"). Each beat lets the next frame be generated more freely, so the image pulses with the music.
 - **Variety:** a new scene drops the previous image from memory, starts at high noise with a new seed and framing, and avoids recently used concepts.
-- **Speed:** SD runs on a high-priority CUDA stream with CLAP and Whisper on low-priority streams in their own threads (SD frame time with Whisper running: 115 → 83 ms; ~50 ms alone on an RTX 4070 Ti SUPER).
+- **Speed:** SD runs on a high-priority CUDA stream with CLAP and Whisper on low-priority streams in their own threads (SD frame time with Whisper running: 115 → 83 ms; ~50 ms alone on an RTX 4070 Ti SUPER). `diff_fast` adds channels_last, cudnn.benchmark and inference_mode, and a short warm-up at load; `diff_compile` optionally wraps the UNet in `torch.compile` (off by default; needs Triton on Windows). Each falls back to the old path with a log line if it fails.
 
 The work directory can be changed with the `AIVIS_WORK` environment variable.
 
@@ -268,6 +277,13 @@ The work directory can be changed with the `AIVIS_WORK` environment variable.
 ```
 pip install -r requirements-dev.txt
 python -m pytest tests
+```
+
+The lyric → image path is tested without a GPU ([tests/test_latency.py](tests/test_latency.py)): fake Whisper and SD objects check window timing, translate-first ordering, retraction, lyric priority, first-frame tagging and the latency breakdown. On the GPU machine, measure the real end-to-end latency with:
+
+```
+D:/ai-visualizer-work/venv/Scripts/python.exe tools/bench_latency.py --wav song_with_vocals.wav
+D:/ai-visualizer-work/venv/Scripts/python.exe tools/bench_latency.py --wav song_with_vocals.wav --legacy
 ```
 
 The tests need neither audio hardware nor OpenGL: beat tracking and section detection run on synthetic signals, the analyzer is fed generated tones and a kick-drum pattern, the director and config are checked directly, the ONNX model is run once, model metrics are checked against floors, and the recorder produces a real MP4 through ffmpeg with a fake GL source (skipped if ffmpeg is missing). GitHub Actions runs lint + tests on every push ([.github/workflows/tests.yml](.github/workflows/tests.yml)).
