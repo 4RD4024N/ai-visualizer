@@ -245,7 +245,7 @@ class DiffusionLayer:
         if self.compile:
             try:
                 self._unet_eager = pipe.unet
-                pipe.unet = torch.compile(pipe.unet, mode="max-autotune-no-cudagraphs", dynamic=False)
+                pipe.unet = torch.compile(pipe.unet, dynamic=False)   # CUDA graph yok: çoklu stream ile güvenli
                 print("[Difüzyon] torch.compile açık (ilk kareler derleme yüzünden yavaş)")
             except Exception as e:
                 self._uncompile(e)
