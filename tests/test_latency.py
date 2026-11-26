@@ -140,6 +140,13 @@ def test_blacklisted_original_retracts_line():
     assert ls.current() is None
 
 
+def test_low_logprob_original_retracts_line():
+    ls, _, _ = make_listener([("we will dance until the sun comes up", None, "tr", -0.3, "ctx")],
+                             originals=[("güneş doğana dek dans edeceğiz", -1.5)])
+    assert ls._step(resample) is None
+    assert ls.current() is None
+
+
 def test_hud_original_off_skips_second_generate():
     ls, _, calls = make_listener([("we will dance until the sun comes up", None, "tr", -0.3, "ctx")],
                                  originals=[], hud_original=False)
