@@ -296,3 +296,23 @@ def test_diffusion_loop_tags_first_lyric_frame():
     finally:
         stop.set()
         d.stop()
+
+
+# ── tools/bench_latency.py (model yüklemeden) ──
+def test_bench_wavtap_and_wav_loading(tmp_path):
+    from scipy.io import wavfile
+    from tools.bench_latency import WavTap, load_wav
+    sr = 16000
+    x = (np.sin(np.arange(sr * 2) / 10) * 20000).astype(np.int16)
+    p = tmp_path / "a.wav"
+    wavfile.write(str(p), sr, x)
+    y, sr2 = load_wav(str(p))
+    assert sr2 == sr and y.dtype == np.float32 and np.abs(y).max() <= 1.0
+    tap = WavTap(y, sr, keep=1.0)
+    out, r = tap.latest_raw()
+    assert r == sr and len(out) == sr and not out.any()        # başlamadan sessiz
+    tap.start()
+    time.sleep(0.2)
+    out, _ = tap.latest_raw()
+    assert out[-100:].any() and not out[:sr // 2].any()
+    assert not tap.done()
