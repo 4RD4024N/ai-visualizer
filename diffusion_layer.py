@@ -77,6 +77,12 @@ def available():
         return False
 
 
+def is_new_line(lyric, lid, seen):
+    """Yeni söz satırı mı? Geri çekilen (uydurma) satırdan sonra görünür hale gelen
+    ESKİ satır yeni sayılmaz: id'ler yalnızca artar."""
+    return lyric is not None and lid is not None and lid > seen
+
+
 def scene_due(age, changed, want_scene, new_line, min_scene, scene_sec,
               lyric_priority=True, lyric_min_scene=0.3):
     """Yeni sahne kurulmalı mı? (torch'suz, birim testli)
@@ -386,7 +392,7 @@ class DiffusionLayer:
                 lyric, lid = self.lyrics.current_with_id()
             else:
                 lyric, lid = self.lyrics.current(), self.lyrics.line_id
-        new_line = lyric is not None and lid != self._lyric_seen
+        new_line = is_new_line(lyric, lid, self._lyric_seen)
         if not scene_due(age, changed, self._want_scene, new_line, self.MIN_SCENE, self.SCENE_SEC,
                          self.lyric_priority, self.LYRIC_MIN_SCENE):
             return                                                       # sahne sürüyor
