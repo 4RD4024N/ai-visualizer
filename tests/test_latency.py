@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 import latency
-from diffusion_layer import DiffusionLayer, scene_due
+from diffusion_layer import DiffusionLayer, is_new_line, scene_due
 from lyrics import LyricsListener
 
 
@@ -72,6 +72,13 @@ def test_scene_due_lyric_priority():
     assert scene_due(0.0, True, False, False, **kw)
     assert scene_due(3.1, False, False, False, **kw)
     assert not scene_due(1.0, False, False, False, **kw)
+
+
+def test_retracted_line_does_not_resurrect_old_line():
+    assert is_new_line("a line", 2, 1)
+    assert not is_new_line("old line", 1, 2)      # 2 geri çekildi, 1 tekrar görünür oldu
+    assert not is_new_line(None, 3, 2)
+    assert not is_new_line("a line", 2, 2)
 
 
 # ── Söz dinleyici: pencere zamanlaması, translate-first, filtre ──
@@ -239,7 +246,7 @@ class FakeDiffusion(DiffusionLayer):
 
     def _update_concepts(self):
         lyric, lid = self.lyrics.current_with_id()
-        new_line = lyric is not None and lid != self._lyric_seen
+        new_line = is_new_line(lyric, lid, self._lyric_seen)
         age = time.time() - self._scene_t
         if scene_due(age, False, False, new_line, self.MIN_SCENE, 99.0, self.lyric_priority,
                      self.LYRIC_MIN_SCENE) and new_line:
